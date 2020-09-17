@@ -164,6 +164,14 @@ Server这里是一个构建函数，里面的代码大概50行，但核心主要
 接下来我们就来详细分析一下。
 
 ### 2.2 绑定并监听
+上一节我们创建了一个服务实例。这个服务实例还没办法对外服务。
+
+对照故事中的情节，相当于把10010店铺准备好了，但是还没有对外宣传和营业。
+
+店铺是一个实体，它本身可以提供商品交易。但是它自己没办法自己宣传和开张。完成宣传和开张的，是店铺的代理人或者店主。
+
+同样的，我们创建的服务实例，不会自己去绑定并监听端口，而是交给其他模块来完成，这个模块，就是TCP实例。
+
 #### 2.2.1 创建TCP实例
 我们再来回顾一下故事中的情节，看下一个普通的服务启动要经过的过程：
 * 绑定一个ip:port地址，即bind();
@@ -227,8 +235,13 @@ function setupListenHandle(address, port, addressType, backlog, fd, flags) {
 ...
 function createServerHandle(address, port, addressType, fd, flags) {
   ...
+  ...
     handle = new TCP(TCPConstants.SERVER);
   ...
+
+      err = handle.bind(address, port);
+  ...
+
   return handle;
 }
 ...
@@ -255,12 +268,12 @@ TCPWrap::TCPWrap(Environment* env, Local<Object> object, ProviderType provider) 
 ```
 
 可以看到，创建TCP实例，其实是调用了libuv的uv_tcp_init。
-##### libuv简介
-uv_tcp_init是libuv的一个方法。到这里，libuv开始介入。我们先来简单介绍一下libuv:
-
-* libuv是一个异步I/O的多平台支持库。当初主要是为了 Node.js而诞生；但它也被用在 Luvit 、 Julia 、 pyuv 和 其他项目 。
-
-* libuv全局管理一个handle，即loop，所有的异步处理对象，都会挂载到loop下，以方便需要时，直接从loop下查找。
+>##### libuv简介
+>uv_tcp_init是libuv的一个方法。到这里，libuv开始介入。我们先来简单介绍一下libuv:
+>
+>* libuv是一个异步I/O的多平台支持库。当初主要是为了 Node.js而诞生；但它也被用在 Luvit 、 Julia 、 pyuv 和 其他项目 。
+>
+>* libuv全局管理一个handle，即loop，所有的异步处理对象，都会挂载到loop下，以方便需要时，直接从loop下查找。
 
 接下来，我们看看uv_tcp_init做了啥：
 ```c++
@@ -278,7 +291,7 @@ int uv_tcp_init_ex(uv_loop_t* loop, uv_tcp_t* tcp, unsigned int flags) {
 ```
 uv_tcp_init调用了uv_tcp_init_ex, 然后最终调用了uv__stream_init。
 
-小结：
+>小结：
 > TCP创建时，调用流程为：uv_tcp_init-->uv_tcp_init_ex->uv__stream_init。
 
 uv__stream_init做了啥呢？他先把steam挂载到loop下，然后执行一系列的初始化操作，最终将stream下的观察者进行初始化
@@ -293,6 +306,59 @@ void uv__stream_init(uv_loop_t* loop, uv_stream_t* stream, uv_handle_type type) 
   uv__io_init(&stream->io_watcher, uv__stream_io, -1);
 }
 ```
-uv__stream_init小结：
-> * 把服务对象（tcp服务，也就是stream）挂载到loop下。
+>uv__stream_init小结：
+> * 把服务对象（TCP实例，也就是stream）挂载到loop下。
 > * 然后对stream执行一系列的初始化操作。
+
+把TCP实例（也就是stream）初始化完成，并挂载到loop下后，就可以真正开始绑定和监听了。
+
+>注：为什么要引入libuv,并把TCP实例挂载到loop下面呢？
+可能你会有疑问，我创建了服务，直接调用bind和listen不就行了吗？为什么还要引入libuv，stream，loop，观察者等一系列复杂的概念呢？
+>
+>原因就是，nodejs服务是单线程的，要处理高并发的请求，就不得不轮询端口是否有请求到来。
+>
+>那不就是写一个for循环吗？至于引入libuv吗？
+>
+>是的，本质上就是一个for循环。但是由于不同的操作系统接口各异，因此才诞生了libuv这个兼容性强的库。
+>
+>关于libuv是如何轮询检测到有请求到来的，本章节暂不展开。
+#### 2.2.3 绑定（bind）
+还记得createServerHandle（第三节 2.2.1小节）中的代码吗？
+
+```js
+// 文件地址：/lib/net.js
+function createServerHandle(address, port, addressType, fd, flags) {
+  ...
+  ...
+    handle = new TCP(TCPConstants.SERVER);
+  ...
+
+      err = handle.bind(address, port);
+  ...
+
+  return handle;
+}
+...
+```
+
+创建完TCP实例后（就是handle），进行了bind。
+```c++
+// 文件地址：/src/tcp_wrap.cc
+template <typename T>
+void TCPWrap::Bind(...) {
+  ...
+    err = uv_tcp_bind(&wrap->handle_,
+                      reinterpret_cast<const sockaddr*>(&addr),
+                      flags);
+  ...
+}
+
+```
+可以看到，这里的bind其实也是调用了libuv的uv_tcp_bind方法。关于libuv的bind方法，本章节同样先不展开。
+#### 2.2.4 监听（listen）
+
+libuv的listen做了很多事情：
+* 首先调用底层的listen
+* 然后调用uv__io_start，把前面创建的stream的io观察者，放到loop的watcher_queue中
+
+至此，nodejs服务启动阶段完成。接下来，我们分析有客户端请求到来时，nodejs服务是如何处理的。
