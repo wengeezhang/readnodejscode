@@ -1,4 +1,5 @@
 解读点：nodejs服务如何启动。
+
 # 一.故事
 “10010百货店”要开张营业了，由于所在的市经贸大厦有规定，店铺外面不能张贴任何标识。
 
@@ -162,11 +163,136 @@ Server这里是一个构建函数，里面的代码大概50行，但核心主要
 
 接下来我们就来详细分析一下。
 
-### 2.2 启动解读
+### 2.2 绑定并监听
+#### 2.2.1 创建TCP实例
 我们再来回顾一下故事中的情节，看下一个普通的服务启动要经过的过程：
 * 绑定一个ip:port地址，即bind();
 * 监听，即listen();
 
 net.js模块也就是干了这些事情；只不过它把所有这些过程都放在了net.js的listen方法中。
+
 那么我们就来分析一下listen。
 
+```js
+// 文件地址：/lib/net.js
+...
+Server.prototype.listen = function(...args) {
+  ...
+  listenInCluster(this, null, options.port | 0, 4, backlog, undefined, options.exclusive);
+  ...
+};
+
+...
+// listenInCluster 最后调用了server._listen2
+function listenInCluster(server, address, port, addressType, backlog, fd, exclusive, flags) {
+  ...
+    server._listen2(address, port, addressType, backlog, fd, flags);
+    return;
+  ...
+}
+
+...
+Server.prototype._listen2 = setupListenHandle;  // legacy alias
+...
+```
+
+（注：我们这里把无关的代码省略，主要看主要逻辑）
+
+从以上代码中，可以看到，整个流程为：
+
+listen --> listenInCluster --> server._listen2。
+
+而server._listen2就是setupListenHandle。
+
+小结：
+> listen方法其实就是setupListenHandle。
+
+那么我们来看下setupListenHandle。
+
+```js
+function setupListenHandle(address, port, addressType, backlog, fd, flags) {
+  ...
+      rval = createServerHandle(address, port, addressType, fd, flags);
+    ...
+    this._handle = rval;
+  ...
+
+  this._handle.onconnection = onconnection;
+  ...
+  const err = this._handle.listen(backlog || 511);
+
+  ...
+}
+
+...
+function createServerHandle(address, port, addressType, fd, flags) {
+  ...
+    handle = new TCP(TCPConstants.SERVER);
+  ...
+  return handle;
+}
+...
+```
+setupListenHandle会调用createServerHandle， 进而创建一个TCP实例，并返回。
+
+#### 2.2.2 TCP实例创建过程分析
+
+new TCP做了啥？
+```C++
+// 文件：/src/tcp_wrap.cc
+void TCPWrap::New(const FunctionCallbackInfo<Value>& args) {
+  ...
+  new TCPWrap(env, args.This(), provider);
+}
+
+...
+
+TCPWrap::TCPWrap(Environment* env, Local<Object> object, ProviderType provider) : ConnectionWrap(env, object, provider) {
+  int r = uv_tcp_init(env->event_loop(), &handle_);
+  ...
+}
+
+```
+
+可以看到，创建TCP实例，其实是调用了libuv的uv_tcp_init。
+##### libuv简介
+uv_tcp_init是libuv的一个方法。到这里，libuv开始介入。我们先来简单介绍一下libuv:
+
+* libuv是一个异步I/O的多平台支持库。当初主要是为了 Node.js而诞生；但它也被用在 Luvit 、 Julia 、 pyuv 和 其他项目 。
+
+* libuv全局管理一个handle，即loop，所有的异步处理对象，都会挂载到loop下，以方便需要时，直接从loop下查找。
+
+接下来，我们看看uv_tcp_init做了啥：
+```c++
+// 文件：/src/deps/uv/src/unix/tcp.c
+int uv_tcp_init(uv_loop_t* loop, uv_tcp_t* tcp) {
+  return uv_tcp_init_ex(loop, tcp, AF_UNSPEC);
+}
+
+int uv_tcp_init_ex(uv_loop_t* loop, uv_tcp_t* tcp, unsigned int flags) {
+  ...
+  uv__stream_init(loop, (uv_stream_t*)tcp, UV_TCP);
+  ...
+  return 0;
+}
+```
+uv_tcp_init调用了uv_tcp_init_ex, 然后最终调用了uv__stream_init。
+
+小结：
+> TCP创建时，调用流程为：uv_tcp_init-->uv_tcp_init_ex->uv__stream_init。
+
+uv__stream_init做了啥呢？他先把steam挂载到loop下，然后执行一系列的初始化操作，最终将stream下的观察者进行初始化
+
+```C++
+void uv__stream_init(uv_loop_t* loop, uv_stream_t* stream, uv_handle_type type) {
+  ...
+  // 把stream挂载到loop下
+  uv__handle_init(loop, (uv_handle_t*)stream, type);
+  ... //一些列的stream初始化操作
+  // 初始化stream->io_watcher。
+  uv__io_init(&stream->io_watcher, uv__stream_io, -1);
+}
+```
+uv__stream_init小结：
+> * 把服务对象（tcp服务，也就是stream）挂载到loop下。
+> * 然后对stream执行一系列的初始化操作。
