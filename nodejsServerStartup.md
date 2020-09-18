@@ -1,5 +1,4 @@
 解读点：nodejs服务如何启动。
-
 # 一.故事
 “10010百货店”要开张营业了，由于所在的市经贸大厦有规定，店铺外面不能张贴任何标识。
 
@@ -218,6 +217,7 @@ listen --> listenInCluster --> server._listen2。
 那么我们来看下setupListenHandle。
 
 ```js
+// 文件： /lib/net.js
 function setupListenHandle(address, port, addressType, backlog, fd, flags) {
   ...
       rval = createServerHandle(address, port, addressType, fd, flags);
@@ -321,7 +321,7 @@ void uv__stream_init(uv_loop_t* loop, uv_stream_t* stream, uv_handle_type type) 
 >
 >是的，本质上就是一个for循环。但是由于不同的操作系统接口各异，因此才诞生了libuv这个兼容性强的库。
 >
->关于libuv是如何轮询检测到有请求到来的，本章节暂不展开。
+>关于libuv是如何轮询检测到有请求到来的，将在下一章【nodejs如何处理用户的请求】中展开解读。
 #### 2.2.3 绑定（bind）
 还记得createServerHandle（第三节 2.2.1小节）中的代码吗？
 
@@ -354,11 +354,86 @@ void TCPWrap::Bind(...) {
 }
 
 ```
-可以看到，这里的bind其实也是调用了libuv的uv_tcp_bind方法。关于libuv的bind方法，本章节同样先不展开。
+可以看到，这里的bind其实也是调用了libuv的uv_tcp_bind方法。关于libuv的bind方法，本章节先不展开。
 #### 2.2.4 监听（listen）
+还是先回顾第三节 2.2.1小节中的代码，其中setupListenHandle在创建完实例后，调用了listen方法：
 
-libuv的listen做了很多事情：
-* 首先调用底层的listen
-* 然后调用uv__io_start，把前面创建的stream的io观察者，放到loop的watcher_queue中
+```js
+// 文件： /lib/net.js
+function setupListenHandle(address, port, addressType, backlog, fd, flags) {
+  ...
+      rval = createServerHandle(address, port, addressType, fd, flags);
+    ...
+    this._handle = rval;
+  ...
 
-至此，nodejs服务启动阶段完成。接下来，我们分析有客户端请求到来时，nodejs服务是如何处理的。
+  this._handle.onconnection = onconnection;
+  ...
+  const err = this._handle.listen(backlog || 511);
+
+  ...
+}
+```
+
+this._handle就是之前创建的TCP实例，它的listen方法代码如下：
+
+```c++
+// 文件： /src/tcp_wrap.cc
+...
+void TCPWrap::Listen(const FunctionCallbackInfo<Value>& args) {
+  ...
+  int err = uv_listen(reinterpret_cast<uv_stream_t*>(&wrap->handle_),
+                      backlog,
+                      OnConnection);
+  ...
+}
+...
+
+// 文件：/deps/uv/src/unix/stream.c
+int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb cb) {
+  ...
+    err = uv_tcp_listen((uv_tcp_t*)stream, backlog, cb);
+  ...
+}
+```
+
+可以看到，listen最终是调用了libuv的uv_tcp_listen方法。它的代码如下：
+
+```c++
+// 文件： /deps/uv/src/unix/tcp.c
+int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
+  ...
+  if (listen(tcp->io_watcher.fd, backlog))
+    return UV__ERR(errno);
+
+  tcp->connection_cb = cb;
+  tcp->flags |= UV_HANDLE_BOUND;
+  ...
+  tcp->io_watcher.cb = uv__server_io;
+  uv__io_start(tcp->loop, &tcp->io_watcher, POLLIN);
+
+  return 0;
+}
+```
+
+上面的显示的代码，每一行都很关键。不过这里我们先关注两行代码：
+* listen(tcp->io_watcher.fd, backlog)：
+    
+    首先调用底层的listen
+* uv__io_start(tcp->loop, &tcp->io_watcher, POLLIN)：
+
+    然后调用uv__io_start，把前面创建的stream的io观察者（&tcp->io_watcher），放到loop的watcher_queue中
+
+至此，nodejs服务启动阶段完成。
+
+# 四.总结：
+一个nodejs服务启动，主要包含三个主要的环节
+* 创建服务实例
+* 绑定ip：port
+* 进行监听，进入工作状态。
+
+但是,在走读代码的过程中，我们还留意到，引入了libuv，创建了TCP实例，并把它挂在到loop下。同时还把TCP实例的观察者（&tcp->io_watcher）挂在到loop的watch_queue对象下。
+
+这些看似琐碎的代码逻辑，却是nodejs的核心关键所在，nodejs就是依赖loop, io_watcher，watch_queue来处理客户端请求的。
+
+那么下一章，我们就来分析有客户端请求到来时，nodejs服务是如何处理的。
