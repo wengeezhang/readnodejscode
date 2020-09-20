@@ -70,6 +70,8 @@ nodejs服务器也是这样。nodejs只有一个主线程，它要负责所有�
 * 王大妈    -->  TCP 通信链接
 * 黄豆，2斤 --> body：{material: "黄豆", number: "2斤"}
 * 机器人   --> nodejs主线程
+* 红色篮子 --> 服务器对应的socket,负责监听是否有新的tcp请求
+* 蓝色篮子 --> 每一个客户端分配一个socket，用于客户端和服务器进行数据通信。
 
 # 三. nodejs源码解读
 ## 1. 解读入口
@@ -468,7 +470,7 @@ uv__io_start我们就比较清晰了，它就是把clientHandle的观察者（io
 
 > 对比故事中的情节，机器人给王大妈的“蓝色篮子”放置好了探测器。
 
-### 2.7 接收客户端传输的真实数据
+### 2.7 tcp连接建立后，开始接收客户端传输的数据
 
 故事中的情节中，机器人给王大妈分配好篮子，并装好探测器后，王大妈可能有两种选择：
 * 1.临时决定不采购东西，离开店铺
@@ -476,18 +478,163 @@ uv__io_start我们就比较清晰了，它就是把clientHandle的观察者（io
 
 如果是第一种情况，那么机器人过一定时间后，会把1号“蓝色篮子”回收，对应于服务器会把tcp链接销毁。
 
-本书主要看服务处理客户端请求的逻辑，因此，我们让王大妈做第二种选择，买东西。
+本书主要分析第二种情况。
 
-王大妈把要买的东西“黄豆,2斤”放到“蓝色篮子”里，这个动作，在nodejs服务中，相当于：
+王大妈把要买的东西“黄豆,2斤”放到“蓝色篮子”里。
+> 这个动作，在nodejs服务中，相当于：
+> 客户端和nodejs服务器建立tcp连接后，开始发送数据给nodejs服务器。
 
-客户端和nodejs服务器建立tcp连接后，开始发送数据给nodejs服务器。
+只不过，此时客户端和服务器之间用来通信的socket，是刚刚创建的客户端socket。
 
-只不过，此时客户端和服务器之间，用来通信的socket，是刚刚创建的客户端socket。
+> 一个nodejs服务实例，对应的只有一个socket，也就是故事中的“红色篮子”；它主要负责接收不同的客户端请求。
+> 每来一个客户端tcp连接请求，服务器会分配一个客户端socket，也就是故事中的“蓝色篮子”（即我们分析的clientHandle）。
+> 后续和每个客户端的通信，都是基于这个客户端socket，即故事中，王大妈和机器人后续都是通过“蓝色篮子”来完成交易。
 
-> 一个nodejs服务实例，对应一个socket；它主要负责接收不同的客户端请求。
-> 每来一个客户端tcp连接请求，服务器会分配一个客户端socket（即我们分析的clientHandle）。
-> 后续和每个客户端的通信，都是基于这个客户端socket。
+此时nodejs服务主线程的无限循环依然在进行，此时的watcher_queue中，不止有服务实例的观察者，还有新创建的客户端通信socket对应的观察者。
 
+我们再把“2.1 uv__io_poll”节中的代码片段贴出来：
+```c++
+// 文件地址：/deps/uv/src/unix/linux-core.c
+void uv__io_poll(uv_loop_t* loop, int timeout) {
+  // 1.设置一堆必要的变量
+  ...
+  // 2.从loop下的watcher_queue依次取出一个观察者对象（在上一章节nodejs服务启动时，曾经创建了一个服务实例，并把该服务实例的观察者挂载到了loop->watcher_queue下）
+  while (!QUEUE_EMPTY(&loop->watcher_queue)) {
+    q = QUEUE_HEAD(&loop->watcher_queue);
+    ...
 
-### 
+    w = QUEUE_DATA(q, uv__io_t, watcher_queue);
+    ...
+      // 3.注册到epoll中
+      epoll_ctl(loop->backend_fd, op, w->fd, &e)
+    ...
+  }
+  ...
+  // 4.开启一个无限循环，监听epoll
+  for (;;) {
+    ...
+    // todo 断点确定一下epoll_wait是否是走这个分支
+      // 4.1.调用epoll_wait，获取有请求到来的服务实例
+      nfds = epoll_wait(loop->backend_fd,
+                        events,
+                        ARRAY_SIZE(events),
+                        timeout);
+    ...
+    // 4.2.依次调用服务实例的回调函数：w->cb
+    for (i = 0; i < nfds; i++) {
+      pe = events + i;
+      fd = pe->data.fd;
+      ...
+      w = loop->watchers[fd];
+
+      ...
+          w->cb(loop, w, pe->events);
+      ...
+    }
+    ...
+  }
+}
+
+```
+
+* 无限循环从watcher_queue中依次取出观察者，注册到epoll中。并进入epoll_wait阶段。
+
+* 一旦客户端发送了真实的数据，epoll_wait就会返回对应的socket。
+* 然后调用对应的回调w->cb()
+
+此时返回的socket，只有一个客户端通信socket。（假设此时没有别的用户访问服务器，只有一个用户在发送请求）。
+
+那么这个socket，对应的回调函数是什么呢？
+
+在本章2.2节中，我们知道，服务实例对应的回调（w->cb）是uv__server_io，那么客户端socket对应的回调，是不是也是uv__server_io呢？
+
+答案为否。
+
+我们来分析一下原因。
+
+* 无论是服务实例对应的socket，还是客户端通信型socket，nodejs都会基于stream类进行封装，二者本质上没什么差别。
+
+* 一个普通的stream，w->cb是指cb，就是指uv__stream_io；
+  
+* 如果是服务端的fd，就会调用listen。listen过程中（uv_tcp_listen）会用uv__server_io覆盖w->cb。
+
+所以客户端通信时，w->cb没有被覆盖，还是 v__stream_io。
+### 2.8 v__stream_io
+
+```c++
+// 文件地址：/deps/uv/src/unix/stream.c
+static void uv__stream_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
+  ...
+  if (events & (POLLIN | POLLERR | POLLHUP))
+    uv__read(stream);
+  ...
+}
+...
+static void uv__read(uv_stream_t* stream) {
+  ...
+  stream->read_cb(stream, UV_ENOBUFS, &buf);
+  ...
+```
+可见，uv__stream_io会调用stream->read_cb；
+read_cb最终会调用self.push(buffer);
+
+// todo read_cb调用self.push(buffer)，会调用js中的方法
+
+self.push就是/lib/_stream_readable.js中的方法：
+
+```js
+// 文件地址：/lib/_stream_readable.js
+Readable.prototype.push = function(chunk, encoding) {
+  return readableAddChunk(this, chunk, encoding, false);
+};
+...
+function readableAddChunk(stream, chunk, encoding, addToFront) {
+  ...
+        addChunk(stream, state, chunk, true);
+  ...
+}
+...
+function addChunk(stream, state, chunk, addToFront) {
+    ...
+    stream.emit('data', chunk);
+    ...
+```
+
+到此，触发了一个'data'事件。这个事件是在哪里注册呢？
+
+答案就是用户自己写的业务代码：
+```js
+// 1.引入net
+const net = require('net');
+// 2.创建一个服务
+const server = net.createServer((c) => {
+  ...
+  c.on('data', () => {
+      console.log('data event');
+      c.write('HTTP/1.1 200 OK\r\n');
+        c.write('Connection: keep-alive\r\n');
+        c.write('Content-Length: 12\r\n');
+        c.write('\r\n');
+        c.write('hello world!');
+  })
+});
+
+// 3.监听端口
+server.listen(9090, () => {
+  console.log('server bound');
+});
+```
+> 注：这里的c，就是net.js中创建的Socket实例，该实例下面的_handle指向客户端通信socket(即封装后的clientHandle)。
+
+业务js逻辑开始接手。
+
 # 四.总结：
+服务启动后，libuv便开始执行一个无限循环，监听watcher_queue队列里的观察者。
+
+没有客户访问时，这个watcher_queue队列中只有一个服务实例的观察者。libuv通过监听这个观察者，判断是否有新用户到来。
+
+一旦有新用户到来，程序就会建立一个新的socket,代表客户端，用于和它进行后续的数据通信。同时把他注册到libuv下监听起来。
+
+这样watcher_queue队列中，就有两个观察者，一个服务实例自身的观察者，一个代表客户端通信型的观察者，libuv会把他俩都注册到epoll中。
+
+客户端发送数据后，libuv会监听到，便会调用客户端观察者对应的回调。回调（uv__stream_io）最终触发一个'data'事件，激活业务js中的代码逻辑。
