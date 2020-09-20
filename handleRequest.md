@@ -1,5 +1,8 @@
 解读点：nodejs服务如何处理客户端请求。
 
+[TOC]
+
+
 # 一.故事
 现在10010店铺正式开业了。
 
@@ -52,20 +55,18 @@
 因此，基于这个分析，“10010百货铺”的运营模式就成了上线故事情节中的那样：
 
 * 只有一个机器人
-* 客人到店后，如果确定要买东西，就写上自己的名字，放到“红色篮子里”，如果不买，就不用写。
+* 客人到店后，如果确定要买东西，就写上自己的名字，放到“红色篮子”里，如果不买，就不用写。
 * 机器人检测到有人要买东西，就给他/她分配一个“蓝色篮子”
-* 客人再把自己的采购需求放到“蓝色篮子里”
+* 客人再把自己的采购需求放到“蓝色篮子”里
 * 机器人完成采购，放到“蓝色篮子里”，客户离开。
 
 ## 1.原理分析
 nodejs服务器也是这样。nodejs只有一个主线程，它要负责所有的工作。
 
-它会实施检测是否有tcp请求到来，如果有，就创建一个socket(代表client)。然后就基于这个client socket和客户端进行通信
+它会实时检测是否有tcp请求到来，如果有，就创建一个socket(代表client)。然后就基于这个client socket和客户端进行通信
 
 ## 2.关联
-在这个故事情节中，王大妈相当于一个TCP，她的需求“黄豆，2斤”,相当于请求的参数；
-
-机器人相当于nodejs主线程
+我们来看下这个故事情节中的事物，和nodejs服务器之间的关联：
 
 * 王大妈    -->  TCP 通信链接
 * 黄豆，2斤 --> body：{material: "黄豆", number: "2斤"}
@@ -75,10 +76,10 @@ nodejs服务器也是这样。nodejs只有一个主线程，它要负责所有�
 
 # 三. nodejs源码解读
 ## 1. 解读入口
-nodejs使用C++开发的。因此nodejs服务，就是一个C++的进程。
-
-这个进程中，只有一个主线程在跑。
->线程池的概念我们后续再展开
+> nodejs使用C++开发的。因此nodejs服务，就是一个C++的进程。
+> 
+> 这个进程中，只有一个主线程在跑。
+> (线程池的概念我们后续再展开)
 
 我们先来看进程启动的简要步骤：
 
@@ -187,14 +188,14 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 
 但是背后的设计理念远不止这一点, 我们看下主要的几个原因:
 
-* 首先一个nodejs进程，可以启动多个不同的服务实例
+* 首先一个nodejs进程，可以启动多个不同的服务实例(不过最佳实践是只启动一个)
   >const svr1 = net.createServer(cb1);
   >const svr2 = net.createServer(cb2);
   >svr1.listen(8080);
   >svr2.listen(9090)
   >
-  >svr1和svr2是两个完全不相关的服务，但是却跑在一个nodejs进程中，公用一个libuv。
-* 每个服务实例，有可能访问其他服务，会产生很多请求型的socket需要监听。
+  >svr1和svr2是两个完全不相关的服务，但是却跑在一个nodejs进程中，共用一个libuv。
+* 每个服务实例，可能会访问其他服务，会产生很多请求型的socket需要监听。
 * libuv虽然是为nodejs而诞生的，但是它现在已经成为通用的i/o库，被更多的产品使用（ Node.js, Luvit, Julia, pyuv, and others），这就要求它必须兼容所有的应用形式。
 
 所以，我们的服务实例虽然只有一个，但还是会统一放进libuv的观察者队列中去，由libuv统一去处理。
@@ -203,7 +204,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 > 回忆一下故事情节中的“红色篮子”。我们的服务实例的观察者对象（tcp->io_watcher）就相当于故事中的“红色篮子”。
 ### 2.2 w->cb
 
-在上一节中，在有请求到来时，程序调用了w->cb。这个回调函数cb是什么呢？它主要的工作是干什么呢？
+在上一节中，在有tcp连接建立时，程序调用了w->cb。这个回调函数cb是什么呢？它主要的工作是干什么呢？
 
 在第一章中，服务启动，我们分析了listen最终调用了uv_tcp_listen。我们这里再把那段代码贴出来看看
 ```C++
@@ -230,7 +231,7 @@ int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
 这个回调函数cb就是uv__server_io。
 
 > 总结：
-> 有请求到来时，程序会调用uv__server_io。
+> 有tcp连接建立时，程序会调用uv__server_io。
 
 
 uv__server_io是stream.c中的一个方法，我们来看下它的代码：
@@ -256,12 +257,13 @@ void uv__server_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
 
 然后再看stream->connection_cb(stream, 0)：
 
-这行代码，会把新创建的客户端socket，交给libuv观测。
+这行代码，会把新创建的客户端socket，进行封装，并交给libuv观测。
 > 对照关联：
 > 故事情节中，机器人给王大妈分配一个“蓝色篮子”后，在篮子上方放置了一个探测器。这个放置探测器的动作，就类似于把新创建的客户端注册到libuv中观测。
 
-### 2.3 stream->connection_cb
 我们来看下stream->connection_cb这个函数，是怎么把新创建的客户端socket，注册到libuv下的。
+
+### 2.3 stream->connection_cb
 
 首先看下stream->connection_cb到底是什么。
 回顾第一章中，监听端口的代码：
