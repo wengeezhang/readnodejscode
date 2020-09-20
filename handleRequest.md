@@ -199,7 +199,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 
 > 对照关联：
 > 回忆一下故事情节中的“红色篮子”。我们的服务实例的观察者对象（tcp->io_watcher）就相当于故事中的“红色篮子”。
-### 2.2.2 w->cb
+### 2.2 w->cb
 
 在上一节中，在有请求到来时，程序调用了w->cb。这个回调函数cb是什么呢？它主要的工作是干什么呢？
 
@@ -254,13 +254,14 @@ void uv__server_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
 
 然后再看stream->connection_cb(stream, 0)：
 
-这行代码，会把新创建的客户端socket，注册到epoll下观测起来。
+这行代码，会把新创建的客户端socket，交给libuv观测。
 > 对照关联：
-> 故事情节中，机器人给王大妈分配一个“蓝色篮子”后，在篮子上方放置了一个探测器。这个放置探测器的动作，就类似于把新创建的客户端注册到epoll。
+> 故事情节中，机器人给王大妈分配一个“蓝色篮子”后，在篮子上方放置了一个探测器。这个放置探测器的动作，就类似于把新创建的客户端注册到libuv中观测。
 
-### 2.2.3 stream->connection_cb
+### 2.3 stream->connection_cb
 我们来看下stream->connection_cb这个函数，是怎么把新创建的客户端socket，注册到libuv下的。
 
+首先看下stream->connection_cb到底是什么。
 回顾第一章中，监听端口的代码：
 ```c++
 // 文件： /src/tcp_wrap.cc
@@ -309,15 +310,13 @@ int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
 
 > 注：stream->connection_cb的stream和tcp->connection_cb的tcp是一个东西。
 
-### 2.2.4 OnConnection
+### 2.4 OnConnection
 OnConnection是/src/connection_wrap.cc下的一个函数，代码如下：
 
 ```c++
 // 代码位置：/src/connection_wrap.cc
 void ConnectionWrap<WrapType, UVType>::OnConnection(uv_stream_t* handle,int status) {
   ...
-  Local<Value> client_handle;
-  if (status == 0) {
     ...
     uv_stream_t* client = reinterpret_cast<uv_stream_t*>(&wrap->handle_);
     // 注意这里是uv_accept，和之前的uv__accept不同。
@@ -325,9 +324,7 @@ void ConnectionWrap<WrapType, UVType>::OnConnection(uv_stream_t* handle,int stat
       return;
 
     client_handle = client_obj;
-  } else {
-    client_handle = Undefined(env->isolate());
-  }
+  ...
 
   Local<Value> argv[] = { Integer::New(env->isolate(), status), client_handle };
   wrap_data->MakeCallback(env->onconnection_string(), arraysize(argv), argv);
@@ -335,17 +332,14 @@ void ConnectionWrap<WrapType, UVType>::OnConnection(uv_stream_t* handle,int stat
 ```
 这里的代码比较晦涩难懂，不过我们来简要概括一下：
 * uv_accept(handle, client)： 给新建的client对象设置fd。只有关联了fd，才能算是一个完整的uv_stream_t,才能交给libuv管理。
-  > 在2.2.2节中，我们提到新创建的客户端socket的fd临时保存在了（stream->accepted_fd = err，err就是新的socket的fd, stream就是这里的handle。）（变量命名的跳跃性，是读者面临的困扰之一）
+  > 在2.2节中，我们有分析到，新创建的客户端socket的fd临时保存在了服务实例下（stream->accepted_fd = err，err就是新的socket的fd, stream就是这里的handle。）（变量命名的跳跃性，是读者面临的困扰之一）
 * wrap_data->MakeCallback(env->onconnection_string(), arraysize(argv), argv)：
-  把client封装，作为参数，调用net.js中的onconnection方法
+  把client封装后，作为参数，调用net.js中的onconnection
 
 那么用户可能会问：
-1. 为什么uv_accept之后，不直接调用libuv的uv__io_start，把新建的client交给libuv呢？再通过js来做，不是多绕了一大圈吗？
-2. 为什么说MakeCallback(env->onconnection_string()），就是调用net.js中的onconnection函数呢？
+为什么说MakeCallback(env->onconnection_string()），就是调用net.js中的onconnection函数呢？
 
-带着这两个问题，我们来继续分析。
-
-### 2.2.5 net.js中的onconnection
+带着这个问题，我们来继续分析。
 
 在第一章2.2.1小节中，分析启动服务时，有解读过以下代码：
 ```js
@@ -366,26 +360,19 @@ function setupListenHandle(address, port, addressType, backlog, fd, flags) {
 ```
 这里有一行代码“this._handle.onconnection = onconnection;”
 
-即把net.js中的onconnection函数，赋给了this._handle；这里的this._handle就是我们的服务器实例。
+// todo wrap_data->MakeCallback解读
 
+即把net.js中的onconnection函数，赋给了this._handle；这里的this._handle就是我们的服务器实例。
+> 小结：
+> 服务实例有客户端请求时，创建一个客户端socket，然后调用net.js中的onconnection
+
+### 2.5 net.js中的onconnection
 
 ```js
+// 文件地址：/lib/net.js
 function onconnection(err, clientHandle) {
-  const handle = this;
-  const self = handle[owner_symbol];
-
-  debug('onconnection');
-
-  if (err) {
-    self.emit('error', errnoException(err, 'accept'));
-    return;
-  }
-
-  if (self.maxConnections && self._connections >= self.maxConnections) {
-    clientHandle.close();
-    return;
-  }
-
+  ...
+  // 封装一个Socket实例对象（该socket是更高级别封装，供js使用）
   const socket = new Socket({
     handle: clientHandle,
     allowHalfOpen: self.allowHalfOpen,
@@ -393,13 +380,114 @@ function onconnection(err, clientHandle) {
     readable: true,
     writable: true
   });
-
-  self._connections++;
-  socket.server = self;
-  socket._server = self;
-
-  DTRACE_NET_SERVER_CONNECTION(socket);
+  ...
   self.emit('connection', socket);
 }
 ```
+> 注：从上面代码中，我们看到，新封装的Socket实例对象，其handle指向了clientHandle，实现了对C++世界中client socket的关联。
+
+onconnection比较简单，做了两件事：
+* 创建一个新的Socket实例对象
+* 触发connection事件，传入刚刚创建的socket对象。
+
+创建Socket实例对象非常重要，也就是在这里，把新建的client对象交给了libuv管理。
+
+我们来看下Socket这个构建函数：
+在Socket初始化的时候，又调用一个read,不过指明读取0个长度
+```js
+// 文件地址：/lib/net.js
+// options.handle就是clientHandle
+// 赋值给socket下的_handle，以备后用
+function Socket(options) {
+  this._handle = options.handle;
+  ...
+  // 接着调用read, 0表示不读取内容。
+  this.read(0);
+}
+```
+
+由于socket继承了Stream，因此这里的read是Stream下的一个方法；由于是读取，因此我们去/lib/_stream_readable.js中找到read方法。
+
+```js
+// 文件地址：/lib/_stream_readable.js
+Readable.prototype.read = function(n) {
+  ...
+  // todo 断点调试，read(0)
+  this._read(state.highWaterMark);
+}
+```
+而这个this._read就是net.js中构建函数Socket的一个原型链方法
+
+```js
+// 文件地址：/lib/net.js
+Socket.prototype._read = function(n) {
+  debug('_read');
+  ...
+    tryReadStart(this);
+  ...
+};
+...
+function tryReadStart(socket) {
+  ...
+  const err = socket._handle.readStart();
+  ...
+}
+```
+
+可以看到，这里最终调用了socket._handle.readStart。Socket构建函数中“this._handle = options.handle;”，表明了_handle是options.handle；而options.handle就是clientHandle。
+
+> 小结：
+> 服务实例收到客户端请求后，创建一个客户端socket的封装对象clientHandle。
+> 然后把clientHandle传递给net.js中的Socket构建函数。
+> Socket构建函数在初始化时，调用了clientHandle的readStart方法。
+
+
+### 2.6 clientHandle的ReadStart方法
+```C++
+// 文件地址：/src/stream_wrap.cc
+int LibuvStreamWrap::ReadStart() {
+  return uv_read_start(stream(), ..., ...);
+}
+```
+
+可以看到，它调用了uv_read_start。
+
+uv_read_start源码分析：
+```C++
+// 文件地址：/src/deps/uv/src/unix/stream.c
+// 这里的stream，其实就是clientHandle。
+int uv_read_start(uv_stream_t* stream,...) {
+  ...
+  uv__io_start(stream->loop, &stream->io_watcher, POLLIN);
+  ...
+}
+```
+uv__io_start我们就比较清晰了，它就是把clientHandle的观察者（io_watcher）挂载到libuv的loop下的watcher_queue中，以便在uv__io_poll阶段，被epoll关注。
+
+到此为止，客户端连接clientHandle算是成功注册到libuv中啦。
+
+> 对比故事中的情节，机器人给王大妈的“蓝色篮子”放置好了探测器。
+
+### 2.7 接收客户端传输的真实数据
+
+故事中的情节中，机器人给王大妈分配好篮子，并装好探测器后，王大妈可能有两种选择：
+* 1.临时决定不采购东西，离开店铺
+* 2.把要购买的东西写下来，放进分配给自己的“蓝色篮子”里面。
+
+如果是第一种情况，那么机器人过一定时间后，会把1号“蓝色篮子”回收，对应于服务器会把tcp链接销毁。
+
+本书主要看服务处理客户端请求的逻辑，因此，我们让王大妈做第二种选择，买东西。
+
+王大妈把要买的东西“黄豆,2斤”放到“蓝色篮子”里，这个动作，在nodejs服务中，相当于：
+
+客户端和nodejs服务器建立tcp连接后，开始发送数据给nodejs服务器。
+
+只不过，此时客户端和服务器之间，用来通信的socket，是刚刚创建的客户端socket。
+
+> 一个nodejs服务实例，对应一个socket；它主要负责接收不同的客户端请求。
+> 每来一个客户端tcp连接请求，服务器会分配一个客户端socket（即我们分析的clientHandle）。
+> 后续和每个客户端的通信，都是基于这个客户端socket。
+
+
+### 
 # 四.总结：
