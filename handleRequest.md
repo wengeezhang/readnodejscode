@@ -61,9 +61,11 @@
 * 机器人完成采购，放到“蓝色篮子里”，客户离开。
 
 ## 1.原理分析
-nodejs服务器也是这样。nodejs只有一个主线程，它要负责所有的工作。
+我们再第一章中分析了nodejs服务启动后，通过net.createServer()创建了一个libuv服务实例（背后绑定了一个socket）。这个服务实例，就对应故事中的“红色篮子”。
+然后把这个服务实例下的观察者（watcher）注册到libuv loop下的watcher_queue队列中；这个动作类似于故事中“红色篮子”上方安装一个探测器，实时探测“红色篮子”的变化。
 
-它会实时检测是否有tcp请求到来，如果有，就创建一个socket(代表client)。然后就基于这个client socket和客户端进行通信
+等有客户端通过三次握手，建立一个tcp链接后，nodejs服务会建立一个libuv客户端实例（背后也绑定了一个socket）。这个客户端实例，就类似于故事中的“蓝色篮子”。
+同样的，这个客户端实例下的观察者（watcher），也会被注册到libuv loop下的watcher_queue队列中。类似于故事中“蓝色色篮子”上方安装一个探测器，实时探测“蓝色篮子”的变化。
 
 ## 2.关联
 我们来看下这个故事情节中的事物，和nodejs服务器之间的关联：
@@ -71,22 +73,24 @@ nodejs服务器也是这样。nodejs只有一个主线程，它要负责所有�
 * 王大妈    -->  TCP 通信链接
 * 黄豆，2斤 --> body：{material: "黄豆", number: "2斤"}
 * 机器人   --> nodejs主线程
-* 红色篮子 --> 服务器对应的socket,负责监听是否有新的tcp请求
-* 蓝色篮子 --> 每一个客户端分配一个socket，用于客户端和服务器进行数据通信。
+* 红色篮子 --> libuv服务实例（对应一个socket）,负责监听是否有新的tcp握手请求。
+* 蓝色篮子 --> 在服务器端为每一个用户创建一个libuv客户端实例（对应一个socket），用于和客户端进行数据通信。
 
 # 三. nodejs源码解读
 ## 1. 解读入口
-> nodejs使用C++开发的。因此nodejs服务，就是一个C++的进程。
-> 
-> 这个进程中，只有一个主线程在跑。
-> (线程池的概念我们后续再展开)
+服务启动以后，服务实例对应的观察者被放进了libuv的watcher_queue队列中。接下来我们来解读程序是怎么遍历循环这个观察者队列的。
+
 
 我们先来看进程启动的简要步骤：
 
 * node_main.cc（入口）：调用node.cc中的Start
 * node.cc：Start函数初始化一个main_instance，然后调用main_instance.Run()
 * node_main_instance.cc：Run函数开启一个无限循环，不断调用uv_run();
-
+> nodejs使用C++开发的。因此nodejs服务，就是一个C++的进程。
+> 
+> 这个进程中，只有一个主线程在跑。
+> (线程池的概念我们后续再展开)
+>
 > 当然实际代码逻辑远远超过这些，进程启动的详细过程在后面章节中详细介绍。
 
 可以看到，进程启动起来以后，在不断地调用uv_run，那么uv_run是干啥呢？
@@ -169,7 +173,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 
 ```
 
-我们把以上代码中的注释集中起来,看一下uv__io_poll的工作：
+我们把以上代码中的注释集中起来,看一下uv__io_poll的工作流程：
 * 1.设置一堆必要的变量
 * 2.从loop下的watcher_queue依次取出一个观察者对象（在上一章节nodejs服务启动时，曾经创建了一个服务实例，并把该服务实例的观察者挂载到了loop->watcher_queue下）
 * 3.注册到epoll中
@@ -179,8 +183,9 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 
 > 注：为了简单易懂，以上分析仅仅以tcp请求为例。
 
+此时的观察者队列中，只有一个服务实例的观察者。
 
-部分读者可能会有疑问，明明我的nodejs服务只有一个实例，为什么不直接把这服务实例注册到epoll中，还非得搞一个while循环，再加一个for循环，不是搞复杂了吗？
+部分读者可能会有疑问，明明只有一个，为什么不直接把这服务实例注册到epoll中，还非得搞一个while循环，再加一个for循环，不是搞复杂了吗？
 
 难道除了我的这个nodejs服务实例，还有别的需要监听关注吗？
 
@@ -201,12 +206,12 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 所以，我们的服务实例虽然只有一个，但还是会统一放进libuv的观察者队列中去，由libuv统一去处理。
 
 > 对照关联：
-> 回忆一下故事情节中的“红色篮子”。我们的服务实例的观察者对象（tcp->io_watcher）就相当于故事中的“红色篮子”。
+> 回忆一下故事情节中的“红色篮子”的作用。我们的服务实例的观察者对象（tcp->io_watcher）就相当于故事中的“红色篮子”。
 ### 2.2 w->cb
 
-在上一节中，在有tcp连接建立时，程序调用了w->cb。这个回调函数cb是什么呢？它主要的工作是干什么呢？
+在上一节中，在有tcp连接建立时，程序调用了w->cb。这个回调函数cb是什么呢？
 
-在第一章中，服务启动，我们分析了listen最终调用了uv_tcp_listen。我们这里再把那段代码贴出来看看
+在第一章中，服务启动时，我们分析了listen最终调用了uv_tcp_listen。我们这里再把那段代码贴出来看看
 ```C++
 // 文件地址： /deps/uv/src/unix/tcp.c
 int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
@@ -230,9 +235,10 @@ int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
 
 这个回调函数cb就是uv__server_io。
 
-> 总结：
+> 小结：
 > 有tcp连接建立时，程序会调用uv__server_io。
 
+在故事中，当机器人检测到有人往“红色篮子”里放字条时，机器人分配了一个“蓝色篮子”，并安装了一个探测器。那么接下来nodejs程序也会执行类似的两个操作。
 
 uv__server_io是stream.c中的一个方法，我们来看下它的代码：
 ```js
@@ -247,21 +253,22 @@ void uv__server_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
     ...
 }
 ```
+
+这段代码有两个重要的函数调用： uv__accept(uv__stream_fd(stream)),stream->connection_cb(stream, 0)。
+
+这两个函数加起来，作用如下：
+* 创建一个客户端实例，类似于分配一个“蓝色篮子”
+* 将客户端实例的观察者（watcher）注册到libuv loop的watcher_queue中，类似于给“蓝色篮子”安装探测器
+
 首先看uv__accept(uv__stream_fd(stream))：
 
-这行代码表示，接受客户端请求，创建一个客户端socket（并把新创建的客户端socket的fd，临时保存在服务实例下）
-
-> 对照关联：
-> 回忆一下故事情节中，机器人从“红色篮子”里面拿出一个字条，并分配了一个“蓝色篮子”给王大妈。
-> 这里的uv__accept，就类似于这个过程，新创建的客户端socket,就是“蓝色篮子”。
+这行代码表示，接受客户端请求，在底层创建一个socket（并把新创建的socket的fd，临时保存在服务实例下）
 
 然后再看stream->connection_cb(stream, 0)：
 
 这行代码，会把新创建的客户端socket，进行封装，并交给libuv观测。
-> 对照关联：
-> 故事情节中，机器人给王大妈分配一个“蓝色篮子”后，在篮子上方放置了一个探测器。这个放置探测器的动作，就类似于把新创建的客户端注册到libuv中观测。
 
-我们来看下stream->connection_cb这个函数，是怎么把新创建的客户端socket，注册到libuv下的。
+我们来看下stream->connection_cb这个函数，是怎么把新创建的客户端socket封装，并注册到libuv下的。
 
 ### 2.3 stream->connection_cb
 
@@ -335,10 +342,11 @@ void ConnectionWrap<WrapType, UVType>::OnConnection(uv_stream_t* handle,int stat
 }
 ```
 这里的代码比较晦涩难懂，不过我们来简要概括一下：
-* uv_accept(handle, client)： 给新建的client对象设置fd。只有关联了fd，才能算是一个完整的uv_stream_t,才能交给libuv管理。
-  > 在2.2节中，我们有分析到，新创建的客户端socket的fd临时保存在了服务实例下（stream->accepted_fd = err，err就是新的socket的fd, stream就是这里的handle。）（变量命名的跳跃性，是读者面临的困扰之一）
+* 新建一个libuv 客户端实例对象。
+* uv_accept(handle, client)： 给新建的客户端实例对象设置fd（即关联背后的socket）。只有关联了fd，才能交给libuv管理。
+  > 在2.2节中，我们有分析到，新创建的socket的fd临时保存在了服务实例下（stream->accepted_fd = err，err就是新的socket的fd, stream就是这里的handle。）（变量命名的跳跃性，是读者面临的困扰之一）
 * wrap_data->MakeCallback(env->onconnection_string(), arraysize(argv), argv)：
-  把client封装后，作为参数，调用net.js中的onconnection
+  把客户端实例对象，作为参数，传给net.js中的onconnection
 
 那么用户可能会问：
 为什么说MakeCallback(env->onconnection_string()），就是调用net.js中的onconnection函数呢？
@@ -391,10 +399,10 @@ function onconnection(err, clientHandle) {
 > 注：从上面代码中，我们看到，新封装的Socket实例对象，其handle指向了clientHandle，实现了对C++世界中client socket的关联。
 
 onconnection比较简单，做了两件事：
-* 创建一个新的Socket实例对象
+* 创建一个Socket实例
 * 触发connection事件，传入刚刚创建的socket对象。
 
-创建Socket实例对象非常重要，也就是在这里，把新建的client对象交给了libuv管理。
+创建Socket实例的过程非常重要，也就是在这里，把新建的libuv客户端实例交给了libuv管理。
 
 我们来看下Socket这个构建函数：
 在Socket初始化的时候，又调用一个read,不过指明读取0个长度
@@ -441,12 +449,12 @@ function tryReadStart(socket) {
 可以看到，这里最终调用了socket._handle.readStart。Socket构建函数中“this._handle = options.handle;”，表明了_handle是options.handle；而options.handle就是clientHandle。
 
 > 小结：
-> 服务实例收到客户端请求后，创建一个客户端socket的封装对象clientHandle。
-> 然后把clientHandle传递给net.js中的Socket构建函数。
-> Socket构建函数在初始化时，调用了clientHandle的readStart方法。
+> libuv服务实例收到客户端请求后，创建一个libuv客户端实例。
+> 然后把libuv客户端实例传递给net.js中的Socket构建函数。
+> Socket构建函数在初始化时，调用了libuv客户端实例的readStart方法。
 
 
-### 2.6 clientHandle的ReadStart方法
+### 2.6 libuv客户端实例的ReadStart方法
 ```C++
 // 文件地址：/src/stream_wrap.cc
 int LibuvStreamWrap::ReadStart() {
@@ -459,16 +467,16 @@ int LibuvStreamWrap::ReadStart() {
 uv_read_start源码分析：
 ```C++
 // 文件地址：/src/deps/uv/src/unix/stream.c
-// 这里的stream，其实就是clientHandle。
+// 这里的stream，其实就是libuv客户端实例。
 int uv_read_start(uv_stream_t* stream,...) {
   ...
   uv__io_start(stream->loop, &stream->io_watcher, POLLIN);
   ...
 }
 ```
-uv__io_start我们就比较清晰了，它就是把clientHandle的观察者（io_watcher）挂载到libuv的loop下的watcher_queue中，以便在uv__io_poll阶段，被epoll关注。
+uv__io_start我们就比较清晰了，它就是把libuv客户端实例的观察者（io_watcher）挂载到libuv的loop下的watcher_queue中，以便在uv__io_poll阶段，被epoll关注。
 
-到此为止，客户端连接clientHandle算是成功注册到libuv中啦。
+到此为止，libuv客户端实例算是成功注册到libuv中啦。
 
 > 对比故事中的情节，机器人给王大妈的“蓝色篮子”放置好了探测器。
 
@@ -486,13 +494,13 @@ uv__io_start我们就比较清晰了，它就是把clientHandle的观察者（io
 > 这个动作，在nodejs服务中，相当于：
 > 客户端和nodejs服务器建立tcp连接后，开始发送数据给nodejs服务器。
 
-只不过，此时客户端和服务器之间用来通信的socket，是刚刚创建的客户端socket。
+只不过，此时客户端和服务器之间用来通信的socket，是刚刚创建的libuv客户端实例背后绑定的socket。
 
-> 一个nodejs服务实例，对应的只有一个socket，也就是故事中的“红色篮子”；它主要负责接收不同的客户端请求。
-> 每来一个客户端tcp连接请求，服务器会分配一个客户端socket，也就是故事中的“蓝色篮子”（即我们分析的clientHandle）。
+> 一个nodejs服务实例（背后对应一个socket），也就是故事中的“红色篮子”；它主要负责接收不同的客户端请求。
+> 每来一个客户端tcp连接请求，服务器会分配一个客户端socket，并封装为libuv客户端实例，也就是故事中的“蓝色篮子”。
 > 后续和每个客户端的通信，都是基于这个客户端socket，即故事中，王大妈和机器人后续都是通过“蓝色篮子”来完成交易。
 
-此时nodejs服务主线程的无限循环依然在进行，此时的watcher_queue中，不止有服务实例的观察者，还有新创建的客户端通信socket对应的观察者。
+nodejs服务主线程的无限循环依然在进行，此时的watcher_queue中，不止有服务实例的观察者，还有新创建的libuv客户端实例对应的观察者。
 
 我们再把“2.1 uv__io_poll”节中的代码片段贴出来：
 ```c++
@@ -539,28 +547,26 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 
 ```
 
-* 无限循环从watcher_queue中依次取出观察者，注册到epoll中。并进入epoll_wait阶段。
+* 无限循环从watcher_queue中取出libuv客户端实例的观察者，注册到epoll中。并进入epoll_wait阶段。
 
-* 一旦客户端发送了真实的数据，epoll_wait就会返回对应的socket。
-* 然后调用对应的回调w->cb()
+* 一旦客户端发送了真实的数据，epoll_wait就会返回。
+* 然后调用libuv客户端实例对应的回调w->cb()
 
-此时返回的socket，只有一个客户端通信socket。（假设此时没有别的用户访问服务器，只有一个用户在发送请求）。
+那么libuv客户端实例对应的回调函数是什么呢？
 
-那么这个socket，对应的回调函数是什么呢？
-
-在本章2.2节中，我们知道，服务实例对应的回调（w->cb）是uv__server_io，那么客户端socket对应的回调，是不是也是uv__server_io呢？
+在本章2.2节中，我们知道，服务实例对应的回调（w->cb）是uv__server_io，那么libuv客户端实例对应的回调，是不是也是uv__server_io呢？
 
 答案为否。
 
 我们来分析一下原因。
 
-* 无论是服务实例对应的socket，还是客户端通信型socket，nodejs都会基于stream类进行封装，二者本质上没什么差别。
+* 无论是libuv服务实例，还是libuv客户端实例，nodejs都会基于stream类进行封装，二者本质上没什么差别。
 
 * 一个普通的stream，w->cb是指cb，就是指uv__stream_io；
   
-* 如果是服务端的fd，就会调用listen。listen过程中（uv_tcp_listen）会用uv__server_io覆盖w->cb。
+* 如果是服务实例，会额外调用listen。listen过程中（uv_tcp_listen）会用uv__server_io覆盖w->cb。
 
-所以客户端通信时，w->cb没有被覆盖，还是 v__stream_io。
+客户端通信时，由于w->cb没有被覆盖，所以此时的w->cb就是 v__stream_io。
 ### 2.8 v__stream_io
 
 ```c++
@@ -626,17 +632,17 @@ server.listen(9090, () => {
   console.log('server bound');
 });
 ```
-> 注：这里的c，就是net.js中创建的Socket实例，该实例下面的_handle指向客户端通信socket(即封装后的clientHandle)。
+> 注：这里的c，就是net.js中创建的Socket实例，该实例下面的_handle指向libuv客户端实例。
 
 业务js逻辑开始接手。
 
 # 四.总结：
 服务启动后，libuv便开始执行一个无限循环，监听watcher_queue队列里的观察者。
 
-没有客户访问时，这个watcher_queue队列中只有一个服务实例的观察者。libuv通过监听这个观察者，判断是否有新用户到来。
+没有客户访问时，这个watcher_queue队列中只有一个服务实例的观察者。libuv通过监听这个观察者，判断是否有新tcp三次握手建立。
 
-一旦有新用户到来，程序就会建立一个新的socket,代表客户端，用于和它进行后续的数据通信。同时把他注册到libuv下监听起来。
+一旦有新用户到来，程序就会建立一个新的socket,代表客户端，并封装成为libuv客户端实例，用于和它进行后续的数据通信。同时把他注册到libuv下监听起来。
 
-这样watcher_queue队列中，就有两个观察者，一个服务实例自身的观察者，一个代表客户端通信型的观察者，libuv会把他俩都注册到epoll中。
+这样watcher_queue队列中，就有两个观察者：一个是服务实例自身的观察者，一个是libuv客户端实例的观察者；libuv在循环阶段会把它俩都注册到epoll中。
 
-客户端发送数据后，libuv会监听到，便会调用客户端观察者对应的回调。回调（uv__stream_io）最终触发一个'data'事件，激活业务js中的代码逻辑。
+客户端发送数据后，内核激活epoll_wait，便会调用libuv客户端实例对应的回调。回调（uv__stream_io）最终触发一个'data'事件，激活业务js中的代码逻辑。
