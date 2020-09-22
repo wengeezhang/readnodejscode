@@ -14,7 +14,21 @@
 做完这些，机器人就走了。
 ![alt 王大妈和李大妈的篮子分配完毕，王大妈的在队列前]()
 
-王大妈要买1斤芝麻，于是写了个字条“芝麻，1斤”，放到5号篮子里；李大妈要买2瓶矿泉水，于是写了个字条“矿泉水，2瓶”，放到6号篮子里。
+王大妈今天要采购的东西包括：
+* 1斤芝麻
+* 2斤土豆
+* 3斤西红柿
+
+于是王大妈写了3个字条“芝麻，1斤”，“土豆，2斤”， “西红柿，3斤”，放到5号篮子里；
+
+李大妈今天要采购的东西包括：
+* 1瓶矿泉水
+* 2斤马铃薯
+* 3包盐
+* 4根火腿肠
+* 5两茶叶
+
+李大妈写了5个字条“矿泉水，1瓶”，“马铃薯，2斤”，“盐，3包”，“火腿肠，4根”，“茶叶，5两”，放到6号篮子里。
 
 王大妈和李大妈在同一时间完成了写字条，放字条的动作。
 
@@ -45,7 +59,112 @@ nodejs服务启动后，只有一个主线程在运行一个无限循环。
 # 三. nodejs源码解读
 ## 1. 解读入口
 
+nodejs的net.js中，并没有判断一个post请求是否结束。
+现在的框架中，一般使用bodyparser之类的库来解析。
 
+我们来看戏koa-bodyparser是怎么做到。
+
+koa-bodyparser
+```js
+// 文件：npm库koa-bodyparser index.js
+var parse = require('co-body');
+...
+module.exports = function (opts) {
+  ...
+
+  return async function bodyParser(ctx, next) {
+    ...
+        const res = await parseBody(ctx);
+    ...
+  };
+
+  async function parseBody(ctx) {
+    if (enableJson && ((detectJSON && detectJSON(ctx)) || ctx.request.is(jsonTypes))) {
+      return await parse.json(ctx, jsonOpts);
+    }
+    ...
+    return {};
+  }
+};
+```
+可以看出它依赖了require('co-body')来解析。
+
+```js
+// 文件：npm库 co-body
+const raw = require('raw-body');
+...
+module.exports = async function(req, opts) {
+  ...
+  // 读取headers中的content-length
+  let len = req.headers['content-length'];
+  const encoding = req.headers['content-encoding'] || 'identity';
+  if (len && encoding === 'identity') opts.length = len = ~~len;
+
+  const str = await raw(inflate(req), opts);
+  ...
+};
+```
+这里，co-body通过require('raw-body')，来读取原生的字符串。
+
+玄机就在raw-body这里。
+```js
+// 文件：npm库 raw-body
+function getRawBody (stream, options, callback) {
+  
+  var length = opts.length != null && !isNaN(opts.length)
+    ? parseInt(opts.length, 10)
+    : null
+  
+  if (done) {
+    // classic callback style
+    return readStream(stream, encoding, length, limit, done)
+  }
+
+  return new Promise(function executor (resolve, reject) {
+    readStream(stream, encoding, length, limit, function onRead (err, buf) {
+      if (err) return reject(err)
+      resolve(buf)
+    })
+  })
+}
+...
+function readStream (stream, encoding, length, limit, callback) {
+  ...
+  // attach listeners
+  stream.on('aborted', onAborted)
+  stream.on('close', cleanup)
+  stream.on('data', onData)
+  stream.on('end', onEnd)
+  stream.on('error', onEnd)
+
+  // mark sync section complete
+  sync = false
+
+  function done () {
+    ...
+  }
+
+  function onAborted () {
+    ...
+  }
+
+  function onData (chunk) {
+    ...
+  }
+
+  function onEnd (err) {
+    ...
+  }
+
+  function cleanup () {
+    ...
+  }
+}
+```
+可以看出，这里通过readStream来读取。读取的大小就在于length。
+这个length就是在co-body中，通过let len = req.headers['content-length'];来读取的。
+通过Content-Length来判断一个请求的大小。
+![alt 如何判定post请求是否结束](./img/postReqCheckEnd.png)
 ## 2. 源码解读
 
 
