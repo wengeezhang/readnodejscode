@@ -169,22 +169,47 @@ const server = net.createServer((c) => {
 
 ### 2.2 如何区分8个请求？
 
-这8个请求，有3个是用户A的，有5个是用户B的。 上一节中，我们解读了如何区分用户。那么问题的本质也就是，如何区分一个用户的不通请求。
+这8个请求，有3个是用户A的，有5个是用户B的。 上一节中，我们解读了如何区分用户。
 
-换一种说法，也就是如何区分用户A的3个请求呢？
+那么问题的本质也就是：如何区分用户A的3个请求呢？
 
 答案是： 留给业务开发自己解决。
 
-也就是，我们必须在c.on('data', () => {...})的回调函数中处理这一切。
+也就是，我们必须在c.on('data', callback)的回调函数callback中处理这一切。
 
 > 现实中，很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），已经封装处理好了，业务开发其实并不用真正关心。
 
-在上一章，2.6小节中，我们知道stream.alloc_cb其实是
+由于用户A的所有请求公用一个c，都是在c.on('data', callback)这里触发，只要能区分3个请求的边界，便可以分别处理了。
+
+伪代码如下：
+
+```js
+    const reqData = [];
+    c.on('data', (chunk) => {
+        if(请求结束标识){
+            reqData.push(chunk);
+            reqData已经完整，开始处理...
+            清空reqData
+            返回
+        }else{
+            reqData.push(chunk)
+        }
+    })
+```
+
+那么业务开发，怎么判断“请求结束标识”呢？
+
+我们知道，现在的http请求一般有get,post, put,delete等方法，常用的有get,post。我们就以get,post来举例，看下怎么判断“请求结束标识”。
+
+#### 2.2.1 get请求
+首先，需要解读一下读取前的配置逻辑。
+在上一章的2.6小节中，我们知道stream.alloc_cb其实是
 ```c++
 // 文件地址：/src/stream_wrap.cc
 [](uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
     static_cast<LibuvStreamWrap*>(handle->data)->OnUvAlloc(suggested_size, buf);
   }
+
 // 文件地址：/deps/uv/src/uv-common.c 
 // todo uv_buf_init端点确认细节
 uv_buf_t uv_buf_init(char* base, unsigned int len) {
@@ -210,8 +235,11 @@ static void uv__read(uv_stream_t* stream) {
 ```
 
 可见，这里分配了一个 64 * 1024 = 65536bytes大小的读取量，然后调用读取方法stream->read_cb()进行读取。
+#### 2.2.2 post请求
 
 
+
+从
 nodejs的net.js中，并没有判断一个post请求是否结束。
 现在的框架中，一般使用bodyparser之类的库来解析。
 
