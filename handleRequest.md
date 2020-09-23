@@ -95,7 +95,7 @@
 
 可以看到，进程启动起来以后，在不断地调用uv_run，那么uv_run是干啥呢？
 
-```js
+```C++
 // 位于/src/deps/uv/src/unix/core.c
 int uv_run(uv_loop_t* loop, uv_run_mode mode) {
   ...
@@ -151,10 +151,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
     ...
     // todo 断点确定一下epoll_wait是否是走这个分支
       // 4.1.调用epoll_wait，获取有请求到来的服务实例
-      nfds = epoll_wait(loop->backend_fd,
-                        events,
-                        ARRAY_SIZE(events),
-                        timeout);
+      nfds = epoll_wait(loop->backend_fd, events, ARRAY_SIZE(events), timeout);
     ...
     // 4.2.依次调用服务实例的回调函数：w->cb
     for (i = 0; i < nfds; i++) {
@@ -458,18 +455,27 @@ function tryReadStart(socket) {
 ```C++
 // 文件地址：/src/stream_wrap.cc
 int LibuvStreamWrap::ReadStart() {
-  return uv_read_start(stream(), ..., ...);
+  return uv_read_start(stream(), [](uv_handle_t* handle,
+                                    size_t suggested_size,
+                                    uv_buf_t* buf) {
+    static_cast<LibuvStreamWrap*>(handle->data)->OnUvAlloc(suggested_size, buf);
+  }, [](uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+    static_cast<LibuvStreamWrap*>(stream->data)->OnUvRead(nread, buf);
+  });
 }
 ```
+> 注意这里，uv_read_start的第2，3个参数，都是函数。在uv_read_start代码中，将会被分别赋给stream->read_cb， stream->alloc_cb
 
-可以看到，它调用了uv_read_start。
+我们来看看uv_read_start的逻辑。
 
 uv_read_start源码分析：
 ```C++
 // 文件地址：/src/deps/uv/src/unix/stream.c
 // 这里的stream，其实就是libuv客户端实例。
-int uv_read_start(uv_stream_t* stream,...) {
+int uv_read_start(uv_stream_t* stream, uv_alloc_cb alloc_cb, uv_read_cb read_cb) {
   ...
+  stream->read_cb = read_cb;
+  stream->alloc_cb = alloc_cb;
   uv__io_start(stream->loop, &stream->io_watcher, POLLIN);
   ...
 }
@@ -584,9 +590,75 @@ static void uv__read(uv_stream_t* stream) {
   ...
 ```
 可见，uv__stream_io会调用stream->read_cb；
-read_cb最终会调用self.push(buffer);
 
-// todo read_cb调用self.push(buffer)，会调用js中的方法
+在2.6小节中，我们知道stream.read_cb其实是
+```c++
+// 文件地址：/src/stream_wrap.cc 
+[](uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    static_cast<LibuvStreamWrap*>(handle->data)->OnUvAlloc(suggested_size, buf);
+  }, [](uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+    static_cast<LibuvStreamWrap*>(stream->data)->OnUvRead(nread, buf);
+  }
+
+void LibuvStreamWrap::OnUvRead(ssize_t nread, const uv_buf_t* buf) {
+  ...
+  EmitRead(nread, *buf);
+}
+```
+可以看出，我们调用stream->read_cb，其实是在调用OnUvRead，并触发EmitRead(nread, *buf);
+
+```C++
+// 文件地址：/src/stream_base-inl.h
+void StreamResource::EmitRead(ssize_t nread, const uv_buf_t& buf) {
+  DebugSealHandleScope handle_scope(v8::Isolate::GetCurrent());
+  if (nread > 0)
+    bytes_read_ += static_cast<uint64_t>(nread);
+  listener_->OnStreamRead(nread, buf);
+}
+// 文件地址：/src/stream_base.c
+void EmitToJSStreamListener::OnStreamRead(ssize_t nread, const uv_buf_t& buf_) {
+  ...
+  stream->CallJSOnreadMethod(nread, buf.ToArrayBuffer());
+}
+
+
+MaybeLocal<Value> StreamBase::CallJSOnreadMethod(ssize_t nread, Local<ArrayBuffer> ab, size_t offset, StreamBaseJSChecks checks) {
+  ...
+
+  Local<Value> onread = wrap->object()->GetInternalField(StreamBase::kOnReadFunctionField);
+  ...
+  return wrap->MakeCallback(onread.As<Function>(), arraysize(argv), argv);
+}
+
+void StreamBase::AddMethods(Environment* env, Local<FunctionTemplate> t) {
+  ...
+  t->PrototypeTemplate()->SetAccessor(
+      FIXED_ONE_BYTE_STRING(env->isolate(), "onread"),
+      BaseObject::InternalFieldGet<
+          StreamBase::kOnReadFunctionField>,
+      BaseObject::InternalFieldSet<
+          StreamBase::kOnReadFunctionField,
+          &Value::IsFunction>);
+}
+```
+
+```js
+// 文件地址：/lib/net.js
+function initSocketHandle(self) {
+  ...
+    self._handle.onread = onStreamRead;
+    ...
+  }
+}
+
+// 文件地址：/lib/internal/stream_base_commons.js
+function onStreamRead(arrayBuffer) {
+  ...
+  result = stream.push(buf);
+  ...
+}
+```
+> 小结：read_cb最终会调用self.push(buffer);
 
 self.push就是/lib/_stream_readable.js中的方法：
 

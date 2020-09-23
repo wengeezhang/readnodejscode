@@ -61,7 +61,7 @@ nodejs服务启动后，只有一个主线程在运行一个无限循环。
 
 在这个循环中，libuv首先通过服务实例的观察者，接受新的客户端tcp握手请求。tcp握手请求建立完成后，对每一个tcp链接创建一个新的客户端实例，并注册到libuv中。
 
-然后libuv将观察新创建的两个客户端实例，一旦有数据到来，便执行对应的回调。
+然后libuv将观察新创建的客户端实例，一旦有数据到来，便执行对应的回调。
 ## 2.关联
 * 王大妈 --> 用户A访问服务，建立的tcp链接
 * 李大妈 --> 用户B访问服务，建立的tcp链接
@@ -72,6 +72,145 @@ nodejs服务启动后，只有一个主线程在运行一个无限循环。
 * 机器人   --> nodejs主线程
 # 三. nodejs源码解读
 ## 1. 解读入口
+libuv的无限循环不断封装的libuv客户端实例是否有数据到来，一旦有数据到来，便执行回调w->cb();
+```c++
+// 位于/src/deps/uv/src/unix/core.c
+int uv_run(uv_loop_t* loop, uv_run_mode mode) {
+  ...
+  while (r != 0 && loop->stop_flag == 0) {
+    ...
+    uv__io_poll(loop, timeout);
+    ...
+  }
+  ...
+}
+// 文件地址：/deps/uv/src/unix/linux-core.c
+void uv__io_poll(uv_loop_t* loop, int timeout) {
+  ...
+  for (;;) {
+      ...
+          w->cb(loop, w, pe->events);
+      ...
+    }
+    ...
+  }
+}
+
+```
+在上一节中，我们分析过，客户端实例的回调，最终会经过一系列链路，触发启动服务时，业务写的回调函数，即下面net.createServer的参数函数
+
+```js
+// 1.引入net
+const net = require('net');
+// 2.创建一个服务
+const server = net.createServer((c) => {
+  ...
+  c.on('data', () => {
+      console.log('data event');
+      c.write('HTTP/1.1 200 OK\r\n');
+        c.write('Connection: keep-alive\r\n');
+        c.write('Content-Length: 12\r\n');
+        c.write('\r\n');
+        c.write('hello world!');
+  })
+});
+
+// 3.监听端口
+server.listen(9090, () => {
+  console.log('server bound');
+});
+```
+
+此时，你的脑海里肯定冒出这样一个疑问，两个用户，8个请求，nodejs怎么区分两个用户，并对8个请求分别处理，并返回结果呢？
+
+## 2.源码解读
+
+### 2.1 如何区分两个用户？
+在服务启动时，会创建一个对应的libuv服务实例，由libuv监听起来。
+还是uv__io_poll这个函数，我们省略无关代码，从另一个角度解读。
+```c++
+// 文件地址：/deps/uv/src/unix/linux-core.c
+void uv__io_poll(uv_loop_t* loop, int timeout) {
+  // 取出服务实例
+  while (!QUEUE_EMPTY(&loop->watcher_queue)) {
+    q = QUEUE_HEAD(&loop->watcher_queue);
+    ...
+  }
+  ...
+  // 4.开启一个无限循环，监听是否有新用户到来
+  for (;;) {
+    ...
+      nfds = epoll_wait(loop->backend_fd, events, ARRAY_SIZE(events), timeout);
+    ...
+        // 新用户来了，便执行回调，为这个新用户创建一个libuv客户端实例
+          w->cb(loop, w, pe->events);
+    ...
+  }
+}
+```
+
+可以看到，程序为每个用户都分配了libuv客户端实例（对应的，内核操作系统也会创建两个socket）。
+
+而每一个libuv客户端实例，就是下面代码片段中的"c"。
+```js
+const server = net.createServer((c) => {
+  ...
+  c.on('data', () => {
+      console.log('data event');
+      c.write('HTTP/1.1 200 OK\r\n');
+        c.write('Connection: keep-alive\r\n');
+        c.write('Content-Length: 12\r\n');
+        c.write('\r\n');
+        c.write('hello world!');
+  })
+});
+```
+>（libuv客户端实例是如何作为参数c传进来的，请参考上一章的解读）
+
+### 2.2 如何区分8个请求？
+
+这8个请求，有3个是用户A的，有5个是用户B的。 上一节中，我们解读了如何区分用户。那么问题的本质也就是，如何区分一个用户的不通请求。
+
+换一种说法，也就是如何区分用户A的3个请求呢？
+
+答案是： 留给业务开发自己解决。
+
+也就是，我们必须在c.on('data', () => {...})的回调函数中处理这一切。
+
+> 现实中，很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），已经封装处理好了，业务开发其实并不用真正关心。
+
+在上一章，2.6小节中，我们知道stream.alloc_cb其实是
+```c++
+// 文件地址：/src/stream_wrap.cc
+[](uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+    static_cast<LibuvStreamWrap*>(handle->data)->OnUvAlloc(suggested_size, buf);
+  }
+// 文件地址：/deps/uv/src/uv-common.c 
+// todo uv_buf_init端点确认细节
+uv_buf_t uv_buf_init(char* base, unsigned int len) {
+  uv_buf_t buf;
+  buf.base = base;
+  buf.len = len;
+  return buf;
+}
+```
+
+而在uv__read中，是这样调用它的：
+```js
+static void uv__read(uv_stream_t* stream) {
+    ...
+  while (stream->read_cb && (stream->flags & UV_HANDLE_READING) && (count-- > 0)) {
+      ...
+    stream->alloc_cb((uv_handle_t*)stream, 64 * 1024, &buf);
+    ...
+    stream->read_cb()
+  }
+  ...
+}
+```
+
+可见，这里分配了一个 64 * 1024 = 65536bytes大小的读取量，然后调用读取方法stream->read_cb()进行读取。
+
 
 nodejs的net.js中，并没有判断一个post请求是否结束。
 现在的框架中，一般使用bodyparser之类的库来解析。
@@ -179,7 +318,6 @@ function readStream (stream, encoding, length, limit, callback) {
 这个length就是在co-body中，通过let len = req.headers['content-length'];来读取的。
 通过Content-Length来判断一个请求的大小。
 ![alt 如何判定post请求是否结束](./img/postReqCheckEnd.png)
-## 2. 源码解读
 
 
 # 四.总结：
