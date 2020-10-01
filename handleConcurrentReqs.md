@@ -34,14 +34,22 @@
 
 此时机器人过来了。
 
-它先从5号篮子里面取出王大妈字条，转身走到后面去取了“1斤芝麻，2斤土豆，3斤西红柿”，放到了5号篮子里。王大妈拿到了东西，离开店铺。
+它先从5号篮子里面取出王大妈的第一个字条（假设顺序上第一个是“1斤芝麻”），转身走到后面去取了“1斤芝麻“，放到了5号篮子里；
+
 
 ![alt 机器人取芝麻放到5号篮子]()
+然后机器人又取一个字条，此时字条是“2斤土豆”，机器人转身走到后面，取 “2斤土豆”，放到了5号篮子里；
 
-接着它又从6号篮子里面取出李大妈的字条，转身走到后面取了“1瓶矿泉水，2斤马铃薯，3包盐，4根火腿肠，5两茶叶”，放到6号篮子里。李大妈拿到了东西，离开店铺。
+接着机器人又取了一个字条，字条时“3斤西红柿”，机器人转身走到后面，取“3斤西红柿”，放到5号篮子里。
+
+机器人又去取字条，此时5号篮子里字条没有了，于是机器人开始去处理6号篮子，开始接待李大妈这个客户。
+
+王大妈拿到了东西，离开店铺。
 
 // todo 5号篮子的消失时机
-![alt 机器人取矿泉水放到6号篮子，5号篮子已经消失]()
+![alt 机器人处理6号篮子，5号篮子已经消失]()
+机器人按照上面的循环动作，处理完李大妈的需求；李大妈拿到东西，离开店铺。
+
 # 二.分析和对照
 从上面的故事场景中看到，10010店铺可以同时服务多个客户。这跟nodejs服务可以处理并发请求是一样的。
 
@@ -142,14 +150,15 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
     ...
       nfds = epoll_wait(loop->backend_fd, events, ARRAY_SIZE(events), timeout);
     ...
-        // 新用户来了，便执行回调，为这个新用户创建一个libuv客户端实例
+        // 新用户来了，便执行回调w->cb。
+        // 上一章已经分析，这里的w->cb就是uv__server_io,为每个新用户创建一个libuv客户端实例
           w->cb(loop, w, pe->events);
     ...
   }
 }
 ```
 
-可以看到，程序为每个用户都分配了libuv客户端实例（对应的，内核操作系统也会创建两个socket）。
+从上面代码的注释解读，可以看到，程序为每个用户都分配了libuv客户端实例（对应的，内核操作系统也会创建两个socket）。
 
 而每一个libuv客户端实例，就是下面代码片段中的"c"。
 ```js
@@ -171,7 +180,7 @@ const server = net.createServer((c) => {
 
 这8个请求，有3个是用户A的，有5个是用户B的。 上一节中，我们解读了如何区分用户。
 
-那么问题的本质也就是：如何区分用户A的3个请求呢？
+那么问题的本质也就演化为：如何区分用户A的3个请求呢？
 
 答案是： 留给业务开发自己解决。
 
@@ -235,15 +244,38 @@ static void uv__read(uv_stream_t* stream) {
 ```
 
 可见，这里分配了一个 64 * 1024 = 65536bytes大小的读取量，然后调用读取方法stream->read_cb()进行读取。
+
+我们先来看看一个普通的http请求的结构
+```js
+1. start line（GET / HTTP/1.1）
+2. header1
+   header2
+   ...
+   headern
+3. 
+4. body数据（可选）
+```
+
+可以看到，一个http包含四部分
+1. 起始行，用于表示请求的类型，协议类型和版本
+2. 头部信息，比如content-type之类的
+3. 空白行，表示请求的元信息已经结束
+4. body数据，附带的数据。get，head等类型的请求没有这一部分。
+
+
+一个http get请求，请求参数一般会放在url后面，body数据为null。
+
+分析到这里，就可以很简单地得出答案了：
+对于GET类型的请求，读取到“空白行”就表示结束了，因此，“空白行”就是我们要寻找的“请求结束标识”。
+
 #### 2.2.2 post请求
 
+由于post类型的请求，会携带body数据。因此，post类型的“请求结束标识”肯定不是“空白行”；并且post请求，有的body数据只有1kb，有的则高达10Mb甚至更多。
+
+那么我们怎么寻找post类型的“请求结束标识”呢？
 
 
-从
-nodejs的net.js中，并没有判断一个post请求是否结束。
-现在的框架中，一般使用bodyparser之类的库来解析。
-
-我们来看戏koa-bodyparser是怎么做到。
+现在的框架中，一般使用bodyparser之类的库来解析。我们来看戏koa-bodyparser是怎么做到。
 
 koa-bodyparser
 ```js
@@ -274,6 +306,7 @@ module.exports = function (opts) {
 // 文件：npm库 co-body
 const raw = require('raw-body');
 ...
+// 这里的req就是ctx
 module.exports = async function(req, opts) {
   ...
   // 读取headers中的content-length
@@ -281,7 +314,7 @@ module.exports = async function(req, opts) {
   const encoding = req.headers['content-encoding'] || 'identity';
   if (len && encoding === 'identity') opts.length = len = ~~len;
 
-  const str = await raw(inflate(req), opts);
+  const str = await raw(inflate(req), opts); // inflate 解压缩http数据流
   ...
 };
 ```
@@ -290,6 +323,7 @@ module.exports = async function(req, opts) {
 玄机就在raw-body这里。
 ```js
 // 文件：npm库 raw-body
+// 这里的stream其实还是ctx
 function getRawBody (stream, options, callback) {
   
   var length = opts.length != null && !isNaN(opts.length)
@@ -347,5 +381,48 @@ function readStream (stream, encoding, length, limit, callback) {
 通过Content-Length来判断一个请求的大小。
 ![alt 如何判定post请求是否结束](./img/postReqCheckEnd.png)
 
+由此来看，对于post类型的请求，我们要寻找的“请求结束标识”，就是请求头中的‘content-lenght’, 即headers['content-length']
 
+
+一般我们用koa-bodyparser时，都会设置一个大小限制
+```js
+// 业务代码
+app.use(bodyParser({
+    formLimit: limitVal,
+    jsonLimit: limitVal,
+}));
+
+// 文件地址：npm koa-bodyparser
+
+function formatOptions(opts, type) {
+  var res = {};
+  copy(opts).to(res);
+  res.limit = opts[type + 'Limit'];
+  return res;
+}
+
+// 文件地址：npm co-body
+opts.limit = opts.limit || '1mb';
+
+// 文件地址：npm raw-body
+ var limit = bytes.parse(opts.limit)
+...
+function onData (chunk) {
+  if (complete) return
+
+  received += chunk.length
+
+  if (limit !== null && received > limit) { // 超过大小限制
+    done(createError(413, 'request entity too large', {
+      limit: limit,
+      received: received,
+      type: 'entity.too.large'
+    }))
+  } else if (decoder) {
+    buffer += decoder.write(chunk)
+  } else {
+    buffer.push(chunk)
+  }
+}
+```
 # 四.总结：

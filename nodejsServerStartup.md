@@ -63,27 +63,6 @@ listen(serv_sock, 20);
 ## 1. 解读入口
 
 按照nodejs官网上的样例，启动一个服务如下：
-```js
-const http = require('http');
-
-const hostname = '127.0.0.1';
-const port = 3000;
-
-const server = http.createServer((req, res) => {
-  res.statusCode = 200;
-  res.setHeader('Content-Type', 'text/plain');
-  res.end('Hello World');
-});
-
-server.listen(port, hostname, () => {
-  console.log(`Server running at http://${hostname}:${port}/`);
-});
-```
-这里使用了nodejs原生模块http来启动一个服务；
-
-实际上，http模块是依赖于nodejs的另外一个原生模块net。
-
-我们可以看下net启动一个服务，是什么样子呢？我们看下直接使用net启动一个服务的样例：
 
 ```js
 // 1.引入net
