@@ -182,13 +182,7 @@ const server = net.createServer((c) => {
 
 那么问题的本质也就演化为：如何区分用户A的3个请求呢？
 
-答案是： 留给业务开发自己解决。
-
-也就是，我们必须在c.on('data', callback)的回调函数callback中处理这一切。
-
-> 现实中，很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），已经封装处理好了，业务开发其实并不用真正关心。
-
-由于用户A的所有请求公用一个c，都是在c.on('data', callback)这里触发，只要能区分3个请求的边界，便可以分别处理了。
+答案是： 我们必须在c.on('data', callback)的回调函数callback中处理这一切。
 
 伪代码如下：
 
@@ -206,7 +200,12 @@ const server = net.createServer((c) => {
     })
 ```
 
-那么业务开发，怎么判断“请求结束标识”呢？
+> 实际上，nodejs已经封装了一个native模块http.js, 通过http-parser(node12以后改为llhttp),来解析用户的请求。
+> 很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），也是基于此做了进一步封装，业务开发其实并不用真正关心。
+
+由于用户A的所有请求公用一个c，都是在c.on('data', callback)这里触发，只要能区分3个请求的边界，便可以分别处理了。
+
+那么业务开发，怎么判断“请求结束标识”呢？ 接下来，我们试着
 
 我们知道，现在的http请求一般有get,post, put,delete等方法，常用的有get,post。我们就以get,post来举例，看下怎么判断“请求结束标识”。
 
