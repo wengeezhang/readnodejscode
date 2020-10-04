@@ -573,7 +573,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 * 如果是服务实例，会额外调用listen。listen过程中（uv_tcp_listen）会用uv__server_io覆盖w->cb。
 
 客户端通信时，由于w->cb没有被覆盖，所以此时的w->cb就是 v__stream_io。
-### 2.8 v__stream_io
+### 2.8 uv__stream_io
 
 ```c++
 // 文件地址：/deps/uv/src/unix/stream.c

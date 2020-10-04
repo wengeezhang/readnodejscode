@@ -200,49 +200,13 @@ const server = net.createServer((c) => {
     })
 ```
 
-> 实际上，nodejs已经封装了一个native模块http.js, 通过http-parser(node12以后改为llhttp),来解析用户的请求。
-> 很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），也是基于此做了进一步封装，业务开发其实并不用真正关心。
-
 由于用户A的所有请求公用一个c，都是在c.on('data', callback)这里触发，只要能区分3个请求的边界，便可以分别处理了。
 
-那么业务开发，怎么判断“请求结束标识”呢？ 接下来，我们试着
+那么业务开发，怎么判断“请求结束标识”呢？ 接下来，我们从小白的角度来分析一下如何判断。
 
-我们知道，现在的http请求一般有get,post, put,delete等方法，常用的有get,post。我们就以get,post来举例，看下怎么判断“请求结束标识”。
+我们知道，现在的http请求一般有get,post, put,delete等方法，不同的方法类型，有不同的“请求结束标识”。
 
 #### 2.2.1 get请求
-首先，需要解读一下读取前的配置逻辑。
-在上一章的2.6小节中，我们知道stream.alloc_cb其实是
-```c++
-// 文件地址：/src/stream_wrap.cc
-[](uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-    static_cast<LibuvStreamWrap*>(handle->data)->OnUvAlloc(suggested_size, buf);
-  }
-
-// 文件地址：/deps/uv/src/uv-common.c 
-// todo uv_buf_init端点确认细节
-uv_buf_t uv_buf_init(char* base, unsigned int len) {
-  uv_buf_t buf;
-  buf.base = base;
-  buf.len = len;
-  return buf;
-}
-```
-
-而在uv__read中，是这样调用它的：
-```js
-static void uv__read(uv_stream_t* stream) {
-    ...
-  while (stream->read_cb && (stream->flags & UV_HANDLE_READING) && (count-- > 0)) {
-      ...
-    stream->alloc_cb((uv_handle_t*)stream, 64 * 1024, &buf);
-    ...
-    stream->read_cb()
-  }
-  ...
-}
-```
-
-可见，这里分配了一个 64 * 1024 = 65536bytes大小的读取量，然后调用读取方法stream->read_cb()进行读取。
 
 我们先来看看一个普通的http请求的结构
 ```js
@@ -267,161 +231,327 @@ static void uv__read(uv_stream_t* stream) {
 分析到这里，就可以很简单地得出答案了：
 对于GET类型的请求，读取到“空白行”就表示结束了，因此，“空白行”就是我们要寻找的“请求结束标识”。
 
-#### 2.2.2 post请求
+#### 2.2.2 post等带有body的请求
 
 由于post类型的请求，会携带body数据。因此，post类型的“请求结束标识”肯定不是“空白行”；并且post请求，有的body数据只有1kb，有的则高达10Mb甚至更多。
 
 那么我们怎么寻找post类型的“请求结束标识”呢？
 
+按照http标准，对于携带body的请求，要么提供content-length，要么通过“transfer-coding： chunked”的方式。
+对于前者，接收方可以通过长度判断数据是否接受完毕；对于后者，则通过接受一个0大小的chunk来判断接受完毕。
 
-现在的框架中，一般使用bodyparser之类的库来解析。我们来看戏koa-bodyparser是怎么做到。
+因此，对于post这类携带body大小的请求，“content-length”或者“size为0的chunk”，就是我们要寻找的“请求结束标识”。
 
-koa-bodyparser
+#### 2.2.3 http解析器
+
+从2.2.1和2.2.2小节中，我们大概知道了怎么区分多个请求的边界。但是如果要真的实现起来，将会非常复杂。
+如果这种事情nodejs不做处理，交给业务使用者，那么恐怕nodejs将会无人问津。
+
+
+基于此，nodejs已经封装了一个native模块http.js。这个模块通过http-parser(node12以后改为llhttp),来解析用户的请求。
+http-parser(或者llhttp)实际上是一个有限状态机，不断读取字符，已实现解析请求数据。
+很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），也是基于此做了进一步封装，业务开发其实并不用真正关心。
+
+接下来，我们来看下，http.js模块，底层是如何运作的。
+
+> 注：由于我们是解读的nodejs14版本，因此，这里的解析器特指llhttp.
+
+##### 2.2.3.1 http.js如何创建服务
+首先来看一个使用http.js模块启动的服务实例：
+
 ```js
-// 文件：npm库koa-bodyparser index.js
-var parse = require('co-body');
+const http = require('http');
+
+const server = http.createServer((req, res) => {
+  console.log('new request');// 某个新请求到来
+  req.on('data', (data) => {
+    console.log('data received');// 请求的数据到来。
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end('Hello World');
+  })
+});
+
+server.listen(3000);
+```
+
+我们发送以下两个请求：
+* post请求，body大小为2M
+* get请求。
+
+那么后台服务打印的日志将会如下：
+// todo 请求顺序验证
+```txt
+new request
+data received
+data received
 ...
-module.exports = function (opts) {
+data received
+new request
+```
+可以看到，post类型的请求，触发了req.on('data', cb)中的回调，而get类型的请求则不会触发。
+
+接下来我们从源码解读为什么是这样。首先看入口代码http.createServer：
+```js
+// 文件位置：/lib/http.js
+const {...
+  Server,
+  ...
+} = require('_http_server');
+function createServer(opts, requestListener) {
+  return new Server(opts, requestListener);
+}
+```
+此处的Server，是_http_server.js中的一个构造函数：
+
+```js
+// 文件位置：/lib/_http_server.js
+const net = require('net');
+...
+function Server(options, requestListener) {
+  ...
+  net.Server.call(this, { allowHalfOpen: true });
+  ...
+  if (requestListener) {
+    this.on('request', requestListener);
+  }
+  ...
+  this.on('connection', connectionListener);
+  ...
+}
+ObjectSetPrototypeOf(Server.prototype, net.Server.prototype);
+ObjectSetPrototypeOf(Server, net.Server);
+...
+module.exports = {
+  ...
+  Server,
+  ...
+};
+```
+
+可以看到，_http_server.js的Server，是基于net.Server的。
+
+##### 2.2.3.2 新tcp建立后，触发哪个回调？
+在上一章中的“2.4 OnConnection”小节中，我们知道，一个新tcp连接建立后，服务调用了net.js中的onconnection函数。
+```js
+// 文件位置：/lib/net.js
+function onconnection(err, clientHandle) {
+  ...
+  self.emit('connection', socket);
+}
+```
+这里触发了connection事件。
+
+在上一章中，通过net.createServer创建的服务实例，我们注意到，在net.js中的Server构造函数中，有如下代码：
+```js
+function Server(options, connectionListener) {
+    ...
+  if (typeof options === 'function') {
+    connectionListener = options;
+    options = {};
+    this.on('connection', connectionListener);
+  } else if (options == null || typeof options === 'object') {
+    options = { ...options };
+
+    if (typeof connectionListener === 'function') {
+      this.on('connection', connectionListener);
+    }
+  }
+  ...
+}
+```
+
+然而，很遗憾，通过http.createServer创建的服务实例，虽然继承了net.Server，但是都不满足if else if中的条件。也就是说，http.createServer中，并没有通过继承net.Server，注册connection事件。
+
+
+
+但是，_http_server.js中的Server，额外做了以下两处设置：
+* this.on('request', requestListener);
+* this.on('connection', connectionListener);
+
+真相就在这里了。http.createServer创建的服务实例，自己额外注册了一个connection事件。回调则是_http_server.js中的connectionListener。
+
+我们来看下这个connectionListener是什么。
+
+```js
+function connectionListener(socket) {
+  defaultTriggerAsyncIdScope(
+    getOrSetAsyncId(socket), connectionListenerInternal, this, socket
+  );
+}
+
+function connectionListenerInternal(server, socket) {
+  ...
+  socket.server = server;
+  const parser = parsers.alloc();
+  parser.socket = socket;
+  socket.parser = parser;
+  ...
+  const parser = parsers.alloc(); // 分配一个解析器
   ...
 
-  return async function bodyParser(ctx, next) {
-    ...
-        const res = await parseBody(ctx);
-    ...
-  };
+  if (socket._handle && socket._handle.isStreamBase &&
+      !socket._handle._consumed) {
+    parser._consumed = true;
+    socket._handle._consumed = true;
+    parser.consume(socket._handle);
+  }
+  
+}
+```
 
-  async function parseBody(ctx) {
-    if (enableJson && ((detectJSON && detectJSON(ctx)) || ctx.request.is(jsonTypes))) {
-      return await parse.json(ctx, jsonOpts);
+从上面代码看到，当一个tcp连接来了以后，回调函数做了两件事情：
+
+* 分配一个parser（即llhttp解析器）
+* 设置请求流的消费方式：parser.consume(socket._handle);
+
+首先是分配解析器。nodejs服务启动时，会先设置1000个大小的解析器池子，当用到的时候就从中取一个。（这部分内容本章节暂不展开，用户只需要知道就行）。
+
+接着是设置消费方式。我们看下parser.consume做了啥。
+
+```c++
+// 文件位置： /src/node_http_parser.cc
+static void Consume(const FunctionCallbackInfo<Value>& args) {
+    ...
+    stream->PushStreamListener(parser);
+  }
+
+// 文件位置： /src/stream_base-inl.h
+void StreamResource::PushStreamListener(StreamListener* listener) {
+  ...
+  listener_ = listener;
+}
+```
+可以看到，主要是将parser赋给了一个变量listener_。
+
+可能读者还是没能搞清楚，把parser赋给/src/stream_base-inl.h中的listener_，有啥意义呢？
+
+别着急，我们接着看。
+
+##### 2.2.3.3 OnStreamRead
+在上一章中，我们知道，当客户端实例分配后，如果该客户端实例上有用户发起请求，那么将会按照如下链路调用：
+uv__stream_io -> uv__read -> stream->read_cb (也就是OnUvRead）
+
+```c++
+// 文件地址：/src/stream_wrap.cc 
+void LibuvStreamWrap::OnUvRead(ssize_t nread, const uv_buf_t* buf) {
+  ...
+  EmitRead(nread, *buf);
+}
+
+// 文件地址：/src/stream_base-inl.h
+void StreamResource::EmitRead(ssize_t nread, const uv_buf_t& buf) {
+  DebugSealHandleScope handle_scope(v8::Isolate::GetCurrent());
+  if (nread > 0)
+    bytes_read_ += static_cast<uint64_t>(nread);
+  listener_->OnStreamRead(nread, buf);
+}
+```
+
+上一节中，我们知道，tcp连接建立时，把解析器parser赋给/src/stream_base-inl.h中的listener_。
+
+因此，这里的listener_->OnStreamRead(nread, buf),将会触发node_http_parser.cc中的OnStreamRead。（而不是/src/stream_base.cc中的OnStreamRead）
+
+```c++
+// 文件位置： /src/node_http_parser.cc
+void OnStreamRead(ssize_t nread, const uv_buf_t& buf) override {
+    ...
+    Local<Value> ret = Execute(buf.base, nread);
+    ...
+  }
+Local<Value> Execute(const char* data, size_t len) {
+    ...
+    if (data == nullptr) {
+      err = llhttp_finish(&parser_);
+    } else {
+      err = llhttp_execute(&parser_, data, len);
+      Save();
     }
     ...
-    return {};
   }
-};
+
 ```
-可以看出它依赖了require('co-body')来解析。
+
+可以看到，程序开始调用Execute，这个Execute调用llhttp_execute，开始正式解析request请求。
+
+##### 2.2.3.4 解析器运行原理
+
+解析器本身设置了几个生命周期，主要的有：
+* fasd
+* fasd
+
+当解析器解析完头部后，会触发parser.onIncoming。
 
 ```js
-// 文件：npm库 co-body
-const raw = require('raw-body');
-...
-// 这里的req就是ctx
-module.exports = async function(req, opts) {
+// 文件位置： /lib/_http_common.js
+function parserOnHeadersComplete(versionMajor, versionMinor, headers, method,
+                                 url, statusCode, statusMessage, upgrade,
+                                 shouldKeepAlive) {
   ...
-  // 读取headers中的content-length
-  let len = req.headers['content-length'];
-  const encoding = req.headers['content-encoding'] || 'identity';
-  if (len && encoding === 'identity') opts.length = len = ~~len;
+  const ParserIncomingMessage = (socket && socket.server &&
+                                 socket.server[kIncomingMessage]) ||
+                                 IncomingMessage;
 
-  const str = await raw(inflate(req), opts); // inflate 解压缩http数据流
+  const incoming = parser.incoming = new ParserIncomingMessage(socket);
   ...
-};
+  return parser.onIncoming(incoming, shouldKeepAlive);
+}
 ```
-这里，co-body通过require('raw-body')，来读取原生的字符串。
+创建一个IncomingMessage实例，并调用parser.onIncoming。
 
-玄机就在raw-body这里。
+
 ```js
-// 文件：npm库 raw-body
-// 这里的stream其实还是ctx
-function getRawBody (stream, options, callback) {
-  
-  var length = opts.length != null && !isNaN(opts.length)
-    ? parseInt(opts.length, 10)
-    : null
-  
-  if (done) {
-    // classic callback style
-    return readStream(stream, encoding, length, limit, done)
-  }
-
-  return new Promise(function executor (resolve, reject) {
-    readStream(stream, encoding, length, limit, function onRead (err, buf) {
-      if (err) return reject(err)
-      resolve(buf)
-    })
-  })
-}
+// 文件位置：/lib/_http_server.js
 ...
-function readStream (stream, encoding, length, limit, callback) {
+parser.onIncoming = parserOnIncoming.bind(undefined, server, socket, state);
+...
+function parserOnIncoming(server, socket, state, req, keepAlive) {
   ...
-  // attach listeners
-  stream.on('aborted', onAborted)
-  stream.on('close', cleanup)
-  stream.on('data', onData)
-  stream.on('end', onEnd)
-  stream.on('error', onEnd)
+  state.incoming.push(req);
 
-  // mark sync section complete
-  sync = false
-
-  function done () {
-    ...
-  }
-
-  function onAborted () {
-    ...
-  }
-
-  function onData (chunk) {
-    ...
-  }
-
-  function onEnd (err) {
-    ...
-  }
-
-  function cleanup () {
-    ...
-  }
+  const res = new server[kServerResponse](req);
+  ...
+    server.emit('request', req, res);
 }
 ```
-可以看出，这里通过readStream来读取。读取的大小就在于length。
-这个length就是在co-body中，通过let len = req.headers['content-length'];来读取的。
-通过Content-Length来判断一个请求的大小。
-![alt 如何判定post请求是否结束](./img/postReqCheckEnd.png)
 
-由此来看，对于post类型的请求，我们要寻找的“请求结束标识”，就是请求头中的‘content-lenght’, 即headers['content-length']
+可以看到，这里触发了一个request事件。此处的req，就是刚刚创建的IncomingMessage实例
 
+回忆一下，在本章"2.2.3.1 http.js如何创建服务"小节中，我们设置了一个事件：
+```js
+// 文件位置：/lib/_http_server.js
+...
+function Server(options, requestListener) {
+  ...
+  if (requestListener) {
+    this.on('request', requestListener);
+  }
+  ...
+}
+```
 
-一般我们用koa-bodyparser时，都会设置一个大小限制
+这里的requestListener，就是业务代码中的回到函数
+
 ```js
 // 业务代码
-app.use(bodyParser({
-    formLimit: limitVal,
-    jsonLimit: limitVal,
-}));
+const http = require('http');
 
-// 文件地址：npm koa-bodyparser
+const server = http.createServer((req, res) => {
+  console.log('new request');// 某个新请求到来
+  req.on('data', (data) => {
+    console.log('data received');// 请求的数据到来。
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end('Hello World');
+  })
+});
 
-function formatOptions(opts, type) {
-  var res = {};
-  copy(opts).to(res);
-  res.limit = opts[type + 'Limit'];
-  return res;
-}
-
-// 文件地址：npm co-body
-opts.limit = opts.limit || '1mb';
-
-// 文件地址：npm raw-body
- var limit = bytes.parse(opts.limit)
-...
-function onData (chunk) {
-  if (complete) return
-
-  received += chunk.length
-
-  if (limit !== null && received > limit) { // 超过大小限制
-    done(createError(413, 'request entity too large', {
-      limit: limit,
-      received: received,
-      type: 'entity.too.large'
-    }))
-  } else if (decoder) {
-    buffer += decoder.write(chunk)
-  } else {
-    buffer.push(chunk)
-  }
-}
+server.listen(3000);
 ```
+
+这个回调函数，重新注册了一个data事件。
+
+这个req，是/lib/_http_incoming.js中的IncomingMessage实例，并不是客户端实例（socket实例）。
+
+
 # 四.总结：
