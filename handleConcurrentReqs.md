@@ -433,11 +433,53 @@ void StreamResource::PushStreamListener(StreamListener* listener) {
 uv__stream_io -> uv__read -> stream->read_cb (也就是OnUvRead）
 
 ```c++
+// 文件位置：/deps/uv/src/unix/stream.c
+static void uv__read(uv_stream_t* stream) {
+  uv_buf_t buf;
+  ...
+  while (stream->read_cb
+      && (stream->flags & UV_HANDLE_READING)
+      && (count-- > 0)) {
+    assert(stream->alloc_cb != NULL);
+
+    buf = uv_buf_init(NULL, 0);
+    // 分配内存，并没有真正从stream中读数据
+    stream->alloc_cb((uv_handle_t*)stream, 64 * 1024, &buf);
+    ...
+    if (!is_ipc) {
+      do {
+        // 开始真正从stream中读数据
+        nread = read(uv__stream_fd(stream), buf.base, buf.len);
+      }
+      while (nread < 0 && errno == EINTR);
+    } else {
+      ...
+    }
+
+    if (nread < 0) {
+      
+    } else if (nread == 0) {
+      
+    } else {
+      ...
+      // 已经从stream中读取一个64 * 1024大小的数据，并放到了buf中
+      // 调用read_cb，通知上层，并把数据传过去
+      stream->read_cb(stream, nread, &buf);
+      ...
+    }
+  }
+}
+```
+
+stream->read_cb就是OnUvRead，
+```c++
 // 文件地址：/src/stream_wrap.cc 
 void LibuvStreamWrap::OnUvRead(ssize_t nread, const uv_buf_t* buf) {
   ...
   EmitRead(nread, *buf);
 }
+
+可以看到，这里就是把读取到的buf数据，继续往上传。
 
 // 文件地址：/src/stream_base-inl.h
 void StreamResource::EmitRead(ssize_t nread, const uv_buf_t& buf) {
@@ -473,6 +515,8 @@ Local<Value> Execute(const char* data, size_t len) {
 ```
 
 可以看到，程序开始调用Execute，这个Execute调用llhttp_execute，开始正式解析request请求。
+
+而从上面的分析可以看到，传递给解析器的，是从stream中读到的1024 * 64大小的字节流。解析器开始对这一块字节数据进行解析。
 
 ##### 2.2.3.4 解析器运行原理
 
@@ -549,9 +593,33 @@ const server = http.createServer((req, res) => {
 server.listen(3000);
 ```
 
+> 小结：当接收到一个新的req请求时，会到有业务代码中http.createServer的回调函数。
+
 这个回调函数，重新注册了一个data事件。
 
 这个req，是/lib/_http_incoming.js中的IncomingMessage实例，并不是客户端实例（socket实例）。
 
+由于req是一个readable stream实例，因此它的on方法是有特殊含义的，我们来看下
+```js
+//文件位置：/lib/_stream_readable.js
+Readable.prototype.on = function(ev, fn) {
+  const res = Stream.prototype.on.call(this, ev, fn);
+  ...
 
+  if (ev === 'data') {
+    ...
+      this.resume();
+  } else if (ev === 'readable') {
+    ...
+  }
+
+  return res;
+};
+```
+
+可以看到，处理调用Stream基类的on注册事件外，还额外调用了this.resume()。
+
+这个this.resume()会在下一个tick中，调用flow方法，触发stream.push(),最终触发data(emit('data'))。
+
+![img 图片](./img/callOnBody.png)
 # 四.总结：
