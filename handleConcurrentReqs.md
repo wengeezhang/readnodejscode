@@ -249,7 +249,7 @@ const server = net.createServer((c) => {
 
 
 基于此，nodejs已经封装了一个native模块http.js。这个模块通过http-parser(node12以后改为llhttp),来解析用户的请求。
-http-parser(或者llhttp)实际上是一个有限状态机，不断读取字符，已实现解析请求数据。
+http-parser(或者llhttp)实际上是一个有限状态机，不断读取字符，以实现解析请求数据。
 很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），也是基于此做了进一步封装，业务开发其实并不用真正关心。
 
 接下来，我们来看下，http.js模块，底层是如何运作的。
@@ -342,7 +342,7 @@ function onconnection(err, clientHandle) {
 ```
 这里触发了connection事件。
 
-在上一章中，通过net.createServer创建的服务实例，我们注意到，在net.js中的Server构造函数中，有如下代码：
+在上一章中，通过net.createServer创建的服务实例，我们注意到，在net.js中的Server构造函数中，有注册一个connection事件，代码如下：
 ```js
 function Server(options, connectionListener) {
     ...
@@ -361,19 +361,20 @@ function Server(options, connectionListener) {
 }
 ```
 
-然而，很遗憾，通过http.createServer创建的服务实例，虽然继承了net.Server，但是都不满足if else if中的条件。也就是说，http.createServer中，并没有通过继承net.Server，注册connection事件。
+然而，很遗憾，通过http.createServer创建的服务实例，虽然继承了net.Server，但是都不满足以上代码中if /else if的条件。也就是说，http.createServer中，并没有注册connection事件。
 
+那到底是哪里注册了connection事件呢？
 
-
-但是，_http_server.js中的Server，额外做了以下两处设置：
+别着急。_http_server.js中的Server，额外做了以下两处设置：
 * this.on('request', requestListener);
 * this.on('connection', connectionListener);
 
-真相就在这里了。http.createServer创建的服务实例，自己额外注册了一个connection事件。回调则是_http_server.js中的connectionListener。
+真相就在这里了。http.createServer创建的服务实例，自己额外注册了一个connection事件。回调则是_http_server.js中的connectionListener函数。
 
-我们来看下这个connectionListener是什么。
+我们来看下_http_server.js中的connectionListener是什么。
 
 ```js
+// 文件位置：/lib/_http_server.js
 function connectionListener(socket) {
   defaultTriggerAsyncIdScope(
     getOrSetAsyncId(socket), connectionListenerInternal, this, socket
@@ -470,6 +471,7 @@ static void uv__read(uv_stream_t* stream) {
   }
 }
 ```
+可以看到，uv__read首先分配一个内存buf，然后从stream流中读取64*1024 = 64k大小的数据。然后把这块数据传给stream->read_cb。
 
 stream->read_cb就是OnUvRead，
 ```c++
@@ -516,15 +518,52 @@ Local<Value> Execute(const char* data, size_t len) {
 
 可以看到，程序开始调用Execute，这个Execute调用llhttp_execute，开始正式解析request请求。
 
-而从上面的分析可以看到，传递给解析器的，是从stream中读到的1024 * 64大小的字节流。解析器开始对这一块字节数据进行解析。
-
 ##### 2.2.3.4 解析器运行原理
 
-解析器本身设置了几个生命周期，主要的有：
-* fasd
-* fasd
+而从上面的分析可以看到，传递给解析器的，是从stream中读到的1024 * 64大小的数据。解析器开始对这一块数据进行解析。
 
-当解析器解析完头部后，会触发parser.onIncoming。
+那么我们可以得出一个结论：解析器不会调用底层指令，它接受一段数据，然后对它进行结构化分析（解析）。
+
+这一点可以从llhttp的官方样例中得到验证：
+```c++
+// llhttp官方样例
+#include "llhttp.h"
+
+llhttp_t parser;
+llhttp_settings_t settings;
+
+/* Initialize user callbacks and settings */
+llhttp_settings_init(&settings);
+
+/* Set user callback */
+settings.on_message_complete = handle_on_message_complete;
+
+/* Initialize the parser in HTTP_BOTH mode, meaning that it will select between
+ * HTTP_REQUEST and HTTP_RESPONSE parsing automatically while reading the first
+ * input.
+ */
+llhttp_init(&parser, HTTP_BOTH, &settings);
+
+/* Parse request! */
+const char* request = "GET / HTTP/1.1\r\n\r\n";
+int request_len = strlen(request);
+
+enum llhttp_errno err = llhttp_execute(&parser, request, request_len);
+if (err == HPE_OK) {
+  /* Successfully parsed! */
+} else {
+  fprintf(stderr, "Parse error: %s %s\n", llhttp_errno_name(err),
+          parser.reason);
+}
+```
+
+在上面样例代码中，传递给llhttp_execute，是“const char* request = "GET / HTTP/1.1\r\n\r\n";”这样一段数据。
+
+这里的解析器本质是一个有限状态，不断解析字符；当解析到特地位置时，便会触发相应的回调。
+
+你可能想到的是，当解析完头部时（碰到空白行），应该会触发一个回调吧。
+
+你猜对了，llhttp会触发一个parserOnHeadersComplete调用。
 
 ```js
 // 文件位置： /lib/_http_common.js
@@ -541,7 +580,7 @@ function parserOnHeadersComplete(versionMajor, versionMinor, headers, method,
   return parser.onIncoming(incoming, shouldKeepAlive);
 }
 ```
-创建一个IncomingMessage实例，并调用parser.onIncoming。
+在这里，创建一个IncomingMessage实例，并调用parser.onIncoming。
 
 
 ```js
@@ -573,8 +612,9 @@ function Server(options, requestListener) {
   ...
 }
 ```
+因此，llhttp解析完头部，调用 parserOnHeadersComplete，parserOnIncoming 后，便触发了request事件。
 
-这里的requestListener，就是业务代码中的回到函数
+this.on('request', requestListener)中的requestListener，就是业务代码中的回到函数
 
 ```js
 // 业务代码
@@ -593,11 +633,16 @@ const server = http.createServer((req, res) => {
 server.listen(3000);
 ```
 
-> 小结：当接收到一个新的req请求时，会到有业务代码中http.createServer的回调函数。
+> 小结：
+> 当接收到一个新的req请求时，首先先读取64k大小的数据，传给llhttp解析。
+> llhttp解析完头部后，触发parserOnHeadersComplete，然后调用parserOnIncoming。
+> parserOnIncoming则触发一个“request”事件，接着调用业务代码中回调函数（即http.createServer入参函数）。
 
-这个回调函数，重新注册了一个data事件。
+这个回调函数requestListener，它有两个入参：req, res。
 
 这个req，是/lib/_http_incoming.js中的IncomingMessage实例，并不是客户端实例（socket实例）。
+
+然后在req下注册了一个data事件。
 
 由于req是一个readable stream实例，因此它的on方法是有特殊含义的，我们来看下
 ```js
@@ -617,9 +662,67 @@ Readable.prototype.on = function(ev, fn) {
 };
 ```
 
-可以看到，处理调用Stream基类的on注册事件外，还额外调用了this.resume()。
+可以看到，除了调用Stream基类的on注册事件外，还额外调用了this.resume()。
 
-这个this.resume()会在下一个tick中，调用flow方法，触发stream.push(),最终触发data(emit('data'))。
+这个this.resume()会在下一个tick中，调用flow方法，触发stream.push(),最终触发“data”事件。(emit('data'))。
+
+> 我们知道，uv__read一次读取了64k大小的数据；所以如果请求中有body数据，那么这第一次读取就读取了部分或者全部的body数据。
+> 因此，我们这里就立刻尝试通过this.resume()触发一次“data”事件。
+
+![img 图片](./img/bodyFirstRead.png)
+
+如果body数据过大，那么第一次读取只能读取一部分。接下来，会进行第二次，第三次读取（同样也是一次读取64k），直到把数据全部读取完毕。
+
+那么第二次，第三次等读取到64k，怎么触发“data”事件呢？
+
+我们来做一个实验，发送一个body大小为2Mb的请求。同时打断点，看下第二次读取数据后，解析器解析完成后，做了啥。
 
 ![img 图片](./img/callOnBody.png)
+
+可以看到，llhttp调用了node_http_parser.cc中的on_body函数。
+
+```c++
+// 文件位置：/src/node_http_parser.cc
+int on_body(const char* at, size_t length) {
+    ...
+    Local<Value> cb = obj->Get(env()->context(), kOnBody).ToLocalChecked();
+    ...
+
+    Local<Value> argv[3] = ...
+
+    MaybeLocal<Value> r = MakeCallback(cb.As<Function>(),
+                                       arraysize(argv),
+                                       argv);
+
+    ...
+  }
+
+```
+可以看到，on_body 调用了一个kOnBody的回调函数。这个函数是什么呢？
+
+这个函数，是在初始化解析器池子的时候设置的，代码如下：
+```js
+// 文件位置：/lib/_http_common.js
+// 解析器池子初始化时，设置parser[kOnBody] = parserOnBody;
+const parsers = new FreeList('parsers', 1000, function parsersCb() {
+  const parser = new HTTPParser();
+  ...
+  parser[kOnBody] = parserOnBody;
+  ...
+  return parser;
+});
+function parserOnBody(b, start, len) {
+    ...
+    const ret = stream.push(slice);
+    ...
+  }
+}
+```
+可以看到，这里最终调用了我们熟悉的stream.push(slice);  （stream.push会触发“data”事件）
+
+![img 图片](./img/bodyAfterFirst.png)
+> 小结：
+> 对于大body类型的请求，第一次读取64k数据，其中的body部分，会通过this.resume()，调用flow方法，触发stream.push(),最终触发“data”事件。(emit('data'))；
+> 后续第二次，第三次，会通过node_http_parser.cc中的on_body来调用stream.push(slice)，最终触发“data”事件。
+
 # 四.总结：
