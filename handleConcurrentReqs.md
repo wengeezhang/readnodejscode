@@ -150,7 +150,7 @@ server.listen(9090, () => {
 ## 2.源码解读
 
 ### 2.1 如何区分两个用户？
-在服务启动时，会创建一个对应的libuv服务实例，由libuv监听起来（即在一个无限循环中不断调用uv__io_poll）。
+在服务启动时，会创建一个对应的libuv服务实例（对应故事中的红色篮子），由libuv监听起来（即在一个无限循环中不断调用uv__io_poll）。
 
 再次看uv__io_poll这个函数，我们省略无关代码，从另一个角度解读。（请注意看注释）
 ```c++
@@ -175,7 +175,9 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 }
 ```
 
-从上面代码的注释解读，可以看到，程序为每个用户都分配了libuv客户端实例（对应的，内核操作系统也会创建两个socket）。
+从上面代码的注释解读，可以看到，程序为每个用户都分配了libuv客户端实例（对应故事中的蓝色篮子）。
+
+> 内核操作系统，会为这两个客户端实例创建两个socket。
 
 而每一个libuv客户端实例，就是下面代码片段中的"c"。
 ```js
@@ -191,7 +193,11 @@ const server = net.createServer((c) => {
   })
 });
 ```
->（libuv客户端实例是如何作为参数c传进来的，请参考上一章的解读）
+> 其实准确来说，这里的“c”是net.js中的Socket实例，是对libuv客户端实例的再一次封装。
+> 
+> 为了简化，我们可以粗略认定这里的c就是libuv客户端实例。
+> 
+>libuv客户端实例是如何作为参数c传进来的，请参考上一章的解读
 
 不同的用户，对应不同的“c”;不同的“c”设置各自的监听事件，各自处理自己的数据，互不影响。
 
@@ -199,7 +205,7 @@ const server = net.createServer((c) => {
 
 ### 2.2 如何区分8个请求？
 
-这8个请求，有3个是用户A的，有5个是用户B的。 
+这8个请求，有3个是用户A的，有5个是用户B的。怎么区分每一个请求呢？ 
 
 答案是： 我们必须在各自的回调函数中来处理这一切【即c.on('data', callback)】。
 
@@ -272,12 +278,13 @@ const server = net.createServer((c) => {
 http-parser(或者llhttp)实际上是一个有限状态机，不断读取字符，以实现解析请求数据。
 很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），也是基于此做了进一步封装，业务开发其实并不用真正关心。
 
-接下来，我们来看下，http.js模块，底层是如何运作的。
+接下来，我们来看下，http解析器是如何运作的。
 
 > 注：由于我们是解读的nodejs14版本，因此，这里的解析器特指llhttp.
+
 // todo 完全按照故事中的场景解读
 ##### 2.2.3.1 http.js如何创建服务
-首先来看一个使用http.js模块启动的服务实例：
+首先来看一个使用http.js模块启动的样例：
 
 ```js
 const http = require('http');
@@ -295,23 +302,7 @@ const server = http.createServer((req, res) => {
 server.listen(3000);
 ```
 
-我们发送以下两个请求：
-* post请求，body大小为2M
-* get请求。
-
-那么后台服务打印的日志将会如下：
-// todo 请求顺序验证
-```txt
-new request
-data received
-data received
-...
-data received
-new request
-```
-可以看到，post类型的请求，触发了req.on('data', cb)中的回调，而get类型的请求则不会触发。
-
-接下来我们从源码解读为什么是这样。首先看入口代码http.createServer：
+首先看入口代码http.createServer：
 ```js
 // 文件位置：/lib/http.js
 const {...
@@ -351,7 +342,7 @@ module.exports = {
 
 可以看到，_http_server.js的Server，是基于net.Server的。
 
-##### 2.2.3.2 新tcp建立后，触发哪个回调？
+##### 2.2.3.2 新用户接受后，触发哪个回调？
 在上一章中的“2.4 OnConnection”小节中，我们知道，一个新tcp连接建立后，服务调用了net.js中的onconnection函数。
 ```js
 // 文件位置：/lib/net.js
@@ -362,7 +353,9 @@ function onconnection(err, clientHandle) {
 ```
 这里触发了connection事件。
 
-在上一章中，通过net.createServer创建的服务实例，我们注意到，在net.js中的Server构造函数中，有注册一个connection事件，代码如下：
+那么必定有个地方已经注册了connection事件。
+
+我们回忆一下，通过net.createServer创建的服务实例，我们注意到，在net.js中的Server构造函数中，有注册一个connection事件，代码如下：
 ```js
 function Server(options, connectionListener) {
     ...
@@ -389,7 +382,7 @@ function Server(options, connectionListener) {
 * this.on('request', requestListener);
 * this.on('connection', connectionListener);
 
-真相就在这里了。http.createServer创建的服务实例，自己额外注册了一个connection事件。回调则是_http_server.js中的connectionListener函数。
+真相就在这里了。http.createServer创建的服务实例，自己注册了一个connection事件。回调则是_http_server.js中的connectionListener函数。
 
 我们来看下_http_server.js中的connectionListener是什么。
 
@@ -421,14 +414,14 @@ function connectionListenerInternal(server, socket) {
 }
 ```
 
-从上面代码看到，当一个tcp连接来了以后，回调函数做了两件事情：
+从上面代码看到，当一个新用户了以后，回调函数做了两件事情：
 
 * 分配一个parser（即llhttp解析器）
 * 设置请求流的消费方式：parser.consume(socket._handle);
 
 首先是分配解析器。nodejs服务启动时，会先设置1000个大小的解析器池子，当用到的时候就从中取一个。（这部分内容本章节暂不展开，用户只需要知道就行）。
 
-接着是设置消费方式。我们看下parser.consume做了啥。
+其次是设置消费方式。我们看下parser.consume做了啥。
 
 ```c++
 // 文件位置： /src/node_http_parser.cc
@@ -500,9 +493,10 @@ void LibuvStreamWrap::OnUvRead(ssize_t nread, const uv_buf_t* buf) {
   ...
   EmitRead(nread, *buf);
 }
-
+```
 可以看到，这里就是把读取到的buf数据，继续往上传。
 
+```c++
 // 文件地址：/src/stream_base-inl.h
 void StreamResource::EmitRead(ssize_t nread, const uv_buf_t& buf) {
   DebugSealHandleScope handle_scope(v8::Isolate::GetCurrent());
@@ -537,6 +531,8 @@ Local<Value> Execute(const char* data, size_t len) {
 ```
 
 可以看到，程序开始调用Execute，这个Execute调用llhttp_execute，开始正式解析request请求。
+
+> 小结：服务端收到用户请求后，调用uv__read从stream流上读取数据，传给解析器进行解析。
 
 ##### 2.2.3.4 解析器运行原理
 
@@ -654,13 +650,14 @@ server.listen(3000);
 ```
 
 > 小结：
-> 当接收到一个新的req请求时，首先先读取64k大小的数据，传给llhttp解析。
-> llhttp解析完头部后，触发parserOnHeadersComplete，然后调用parserOnIncoming。
-> parserOnIncoming则触发一个“request”事件，接着调用业务代码中回调函数（即http.createServer入参函数）。
+> 1.当接收到一个新的req请求时，首先先读取64k大小的数据，传给llhttp解析。
+> 2.llhttp解析完头部后，触发parserOnHeadersComplete，然后调用parserOnIncoming。
+> 3.parserOnIncoming则触发一个“request”事件，接着调用业务代码中回调函数（即http.createServer入参函数）。
 
+###### requestListener的处理第一次读取
 这个回调函数requestListener，它有两个入参：req, res。
 
-这个req，是/lib/_http_incoming.js中的IncomingMessage实例，并不是客户端实例（socket实例）。
+其中req，是/lib/_http_incoming.js中的IncomingMessage实例，并不是客户端实例（socket实例）。
 
 然后在req下注册了一个data事件。
 
@@ -686,12 +683,19 @@ Readable.prototype.on = function(ev, fn) {
 
 这个this.resume()会在下一个tick中，调用flow方法，触发stream.push(),最终触发“data”事件。(emit('data'))。
 
-> 我们知道，uv__read一次读取了64k大小的数据；所以如果请求中有body数据，那么这第一次读取就读取了部分或者全部的body数据。
-> 因此，我们这里就立刻尝试通过this.resume()触发一次“data”事件。
+我们知道，uv__read一次读取了64k大小的数据；所以如果请求中有body数据，那么这第一次读取，不仅读取了头部，还会读取部分或者全部的body数据。
+
+因此，我们这里就立刻尝试通过this.resume()触发一次“data”事件。
+
+> 对应于故事中，王大妈的第一个纸条，信息量比较小，机器人一次就能读取完毕，知道王大妈需要采购“芝麻，1斤”。
 
 ![img 图片](./img/bodyFirstRead.png)
 
+###### requestListener的处理第二次及后续读取
+
 如果body数据过大，那么第一次读取只能读取一部分。接下来，会进行第二次，第三次读取（同样也是一次读取64k），直到把数据全部读取完毕。
+
+> 对应于故事中，王大妈的第三个请求，对西红柿的采购要求特别高，王大妈写了个非常长的字条，机器人一次读取不完。
 
 那么第二次，第三次等读取到64k，怎么触发“data”事件呢？
 
@@ -700,6 +704,8 @@ Readable.prototype.on = function(ev, fn) {
 ![img 图片](./img/callOnBody.png)
 
 可以看到，llhttp调用了node_http_parser.cc中的on_body函数。
+
+on_body函数的代码如下：
 
 ```c++
 // 文件位置：/src/node_http_parser.cc
@@ -742,7 +748,15 @@ function parserOnBody(b, start, len) {
 
 ![img 图片](./img/bodyAfterFirst.png)
 > 小结：
-> 对于大body类型的请求，第一次读取64k数据，其中的body部分，会通过this.resume()，调用flow方法，触发stream.push(),最终触发“data”事件。(emit('data'))；
-> 后续第二次，第三次，会通过node_http_parser.cc中的on_body来调用stream.push(slice)，最终触发“data”事件。
+> 1.对于大body类型的请求，第一次读取64k数据，其中的body部分，会通过this.resume()，调用flow方法，触发stream.push(),最终触发“data”事件。(emit('data'))；
+> 
+> 2.后续第二次，第三次，会通过node_http_parser.cc中的on_body来调用stream.push(slice)，最终触发“data”事件。
+
+到此，我们就知道了，对于一个用户内的不同请求，是通过llhttp解析器来区分不同的请求的。
 
 # 四.总结：
+
+nodejs服务只有一个主线程在处理逻辑;但是通过libuv loop循环，精确区分每一个用户；同时通过http解析器区分同一个用户下的不同请求。最终实现处理并发请求的能力。
+
+最后，我们把故事中的场景，放到nodejs的源码程序中，得到一张处理序列图，希望能够把nodejs抽象复杂的处理逻辑，变得直观一些。
+![img 处理请求的调用次序图](./img/callSequence.png)
