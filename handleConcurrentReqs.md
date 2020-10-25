@@ -41,27 +41,37 @@
 李大妈写了2个字条“矿泉水，1瓶”，“马铃薯，2斤”，放到6号篮子里。
 
 ![img 王大妈李大妈放字条](./img/twoPersonPutNote.png)
+
+> 请注意，由于王大妈在同一时间只能写一张字条，因此，她的三个购物需求字条，是有顺序的；同样李大妈的字条也是。
+
 此时机器人过来了。
 
-它先从5号篮子里面取出王大妈的三个字条，放到面前的长条桌子上。然后又从6号篮子里取出李大妈的二个字条，也放到桌子上，如下图所示。
+它先从5号篮子里面取出王大妈的第一个字条，放到面前的长条桌子上；但是此时他并没有真正处理王大妈的需求，而是去6号篮子里取出李大妈的第一个字条，也放到桌子上（同样也不会处理李大妈的字条），如下图所示。
 
-![img 王大妈写了一张非常长的字条](./img/robotTakeAllNotes.png)
+![img 机器人分别取一个字条](./img/twoPersonRobotTakeNote.png)
+
+机器人发现没有新用户了（只有王大妈和李大妈），因此机器人开始顺序处理台面上“王大妈的字条”和“李大妈的字条”。
+
+这一轮处理完成后，状态如下图所示：
+
+![img 机器人分别处理字条](./img/twoPersonRobotProcessNoteOver.png)
+
+接着，再分别取一个字条：
+
+![img 机器人分别取第二轮字条](./img/twoPersonRobotTakeSecondNote.png)
+
+再处理一轮后，如下：
+
+![img 机器人处理第二轮](./img/twoPersonRobotProcessSecondNoteOver.png)
 
 > 上图中，那张长长的字条就代表王大妈一直在写的“西红柿”采购要求。
 
-然后机器人按照顺序，依次处理长条桌子上的纸条，详细流程如下：
-* 取第一个纸条，“芝麻，1斤”，去后面货架取芝麻放到5号篮子里
-* 取第二个纸条，“土豆，2斤”，去后面货架取土豆放到5号篮子里
-* 取第三个纸条，由于机器人发现这个字条还没写完，因此机器人只是读取一下内容。
-* 取第四个纸条，“矿泉水，1瓶”，去后面货架取矿泉水放到6号篮子里
-* 取第五个纸条，“马铃薯，2斤”，去后面货架取马铃薯放到6号篮子里
+然后再分别取一个字条：（注意李大妈篮子里没有了，所以只取到一张字条）
+![img 机器人分别取第三轮字条](./img/twoPersonRobotTakeThirdNote.png)
 
-此时，5号篮子里，有芝麻和土豆；6号篮子里有矿泉水和马铃薯。机器人面前的长条桌上，只剩下一个字条。
+机器人开始又一轮处理。但是此时由于王大妈还没有写完，因此这一轮处理并不能完成。
 
-
-![alt 还剩下王大妈的长字条](./img/stillWritingLongNote.png)
-
-王大妈继续写，机器人继续读这个长字条。
+于是机器人循环下去，一直处理王大妈的“长字条”。
 
 李大妈突然接到老伴电话，还要再采购
 * 3包盐
@@ -70,20 +80,22 @@
 
 于是李大妈又往6号篮子里写了三个字条“盐，3包”，“火腿肠，4根”，“茶叶，5两”。
 
+![img 李大妈放新的字条](./img/twoPersonLiPutNewNotes.png)
 
-机器人发现6号篮子里面有新需求了，于是把6号篮子里的三个字条取出，放到了长桌上。
 
-此时长桌上一共有4个字条需要处理。机器人依然是按照顺序，处理。
+此时机器人还是照常遍历每个篮子。发现5号篮子的长字条依然在写，同时发现6号篮子里面有新需求了，于是把6号篮子里的新字条取出，放到了长桌上。
 
-* 取第一个纸条，由于机器人发现这个字条还没写完，因此机器人只是读取一下内容。
-* 取第二个纸条，“盐，3包”，去后面货架取盐放到6号篮子里
-* 取第三个纸条，“火腿肠，4根”，去后面货架取火腿肠放到6号篮子里
-* 取第四个纸条，“茶叶，5两”，去后面货架取茶叶放到6号篮子里
+![img 机器人取李大妈新的字条](./img/twoPersonRobotTakeLiNewNote.png)
+
+李大妈的三个新需求，都是简单的需求，机器人经过三轮便会处理完毕。
+
+![img 机器人取李大妈新的字条](./img/twoPersonRobotProcessLiNewNotesOver.png)
 
 此时李大妈拿到了所有的东西，离开商店。
 
 王大妈还在写“西红柿”的采购要求。终于，王大妈写完了，机器人拿到了全部纸条内容，从后面货架上取到了符合要求的西红柿，放到5号篮子里。
 
+![img 处理完所有请求](./img/twoPersonRobotProcessAllOver.png)
 王大妈拿到了所有的东西，离开商店。
 
 
@@ -130,10 +142,10 @@ const server = net.createServer((c) => {
   c.on('data', () => {
       console.log('data event');
       c.write('HTTP/1.1 200 OK\r\n');
-        c.write('Connection: keep-alive\r\n');
-        c.write('Content-Length: 12\r\n');
-        c.write('\r\n');
-        c.write('hello world!');
+      c.write('Connection: keep-alive\r\n');
+      c.write('Content-Length: 12\r\n');
+      c.write('\r\n');
+      c.write('hello world!');
   })
 });
 
@@ -143,7 +155,7 @@ server.listen(9090, () => {
 });
 ```
 
-我们分析过，有请求到来时，最终会经过一系列链路，触发启动服务时，业务写的回调函数，即上面net.createServer的参数函数。
+在上一章我们分析过，有请求到来时，最终会经过一系列链路，触发“启动服务时业务写的回调函数”，即上面net.createServer的参数函数。
 
 此时，你的脑海里肯定冒出这样一个疑问，两个用户，8个请求，而且还包含一个超大包的请求，nodejs怎么区分两个用户，并对8个请求分别处理，并返回结果呢？
 
@@ -152,7 +164,9 @@ server.listen(9090, () => {
 ### 2.1 如何区分两个用户？
 在服务启动时，会创建一个对应的libuv服务实例（对应故事中的红色篮子），由libuv监听起来（即在一个无限循环中不断调用uv__io_poll）。
 
-再次看uv__io_poll这个函数，我们省略无关代码，从另一个角度解读。（请注意看注释）
+在故事场景中，机器人分别分配了“5号篮子”和“6号篮子”，用来区分王大妈和李大妈。同样，nodejs也会分配两个客户端实例，用来区分用户A和用户B的请求数据。
+
+这个任务就是由uv__io_poll这个函数来做的。我们省略无关代码，从另一个角度解读。（请注意看注释）
 ```c++
 // 文件地址：/deps/uv/src/unix/linux-core.c
 void uv__io_poll(uv_loop_t* loop, int timeout) {
@@ -174,8 +188,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
   }
 }
 ```
-
-从上面代码的注释解读，可以看到，程序为每个用户都分配了libuv客户端实例（对应故事中的蓝色篮子）。
+上一章已经分析，这里的w->cb就是uv__server_io,为每个新用户创建一个libuv客户端实例。
 
 > 内核操作系统，会为这两个客户端实例创建两个socket。
 
@@ -186,10 +199,10 @@ const server = net.createServer((c) => {
   c.on('data', () => {
       console.log('data event');
       c.write('HTTP/1.1 200 OK\r\n');
-        c.write('Connection: keep-alive\r\n');
-        c.write('Content-Length: 12\r\n');
-        c.write('\r\n');
-        c.write('hello world!');
+      c.write('Connection: keep-alive\r\n');
+      c.write('Content-Length: 12\r\n');
+      c.write('\r\n');
+      c.write('hello world!');
   })
 });
 ```
@@ -274,7 +287,7 @@ const server = net.createServer((c) => {
 如果这种事情nodejs不做处理，交给业务使用者，那么恐怕nodejs将会无人问津。
 
 
-基于此，nodejs已经封装了一个native模块http.js。这个模块通过http-parser(node12以后改为llhttp),来解析用户的请求。
+基于此，nodejs封装了一个native模块http.js。这个模块通过http-parser(node12以后改为llhttp),来解析用户的请求。
 http-parser(或者llhttp)实际上是一个有限状态机，不断读取字符，以实现解析请求数据。
 很多的nodejs框架以及连带的库（比如koajs + koa-bodyparser），也是基于此做了进一步封装，业务开发其实并不用真正关心。
 
@@ -397,18 +410,16 @@ function connectionListener(socket) {
 function connectionListenerInternal(server, socket) {
   ...
   socket.server = server;
-  const parser = parsers.alloc();
+  const parser = parsers.alloc();// 分配一个解析器
   parser.socket = socket;
   socket.parser = parser;
-  ...
-  const parser = parsers.alloc(); // 分配一个解析器
   ...
 
   if (socket._handle && socket._handle.isStreamBase &&
       !socket._handle._consumed) {
     parser._consumed = true;
     socket._handle._consumed = true;
-    parser.consume(socket._handle);
+    parser.consume(socket._handle);// 设置请求流的消费方式
   }
   
 }
@@ -477,7 +488,7 @@ static void uv__read(uv_stream_t* stream) {
     } else {
       ...
       // 已经从stream中读取一个64 * 1024大小的数据，并放到了buf中
-      // 调用read_cb，通知上层，并把数据传过去
+      // 此时便可以调用read_cb，通知上层，并把数据传过去
       stream->read_cb(stream, nread, &buf);
       ...
     }
@@ -494,7 +505,7 @@ void LibuvStreamWrap::OnUvRead(ssize_t nread, const uv_buf_t* buf) {
   EmitRead(nread, *buf);
 }
 ```
-可以看到，这里就是把读取到的buf数据，继续往上传。
+可以看到，这里就是把读取到的buf数据，继续往上传（即扩散出去，EmitRead）。
 
 ```c++
 // 文件地址：/src/stream_base-inl.h
@@ -506,9 +517,11 @@ void StreamResource::EmitRead(ssize_t nread, const uv_buf_t& buf) {
 }
 ```
 
-上一节中，我们知道，tcp连接建立时，把解析器parser赋给/src/stream_base-inl.h中的listener_。
+上一节中，我们留了一个问题还没解答，即：tcp连接建立时，把解析器parser赋给/src/stream_base-inl.h中的listener_，为什么要这么做？
 
-因此，这里的listener_->OnStreamRead(nread, buf),将会触发node_http_parser.cc中的OnStreamRead。（而不是/src/stream_base.cc中的OnStreamRead）
+到这里，答案便很清楚了，是为了请求数据到来时，可以拿到这个parser(即listener_)，进行原始数据解析。
+
+这里的listener_->OnStreamRead(nread, buf),将会触发node_http_parser.cc中的OnStreamRead。（注意，不是/src/stream_base.cc中的OnStreamRead）
 
 ```c++
 // 文件位置： /src/node_http_parser.cc
@@ -691,6 +704,7 @@ Readable.prototype.on = function(ev, fn) {
 
 ![img 图片](./img/bodyFirstRead.png)
 
+> 注：对应故事场景中，“机器人取字条到桌子上”这个动作，等同于nodejs中的uv__read动作，即从stream上读取一块64K大小的数据到buf中。
 ###### requestListener的处理第二次及后续读取
 
 如果body数据过大，那么第一次读取只能读取一部分。接下来，会进行第二次，第三次读取（同样也是一次读取64k），直到把数据全部读取完毕。
