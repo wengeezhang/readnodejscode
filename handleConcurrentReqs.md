@@ -667,14 +667,51 @@ server.listen(3000);
 > 2.llhttp解析完头部后，触发parserOnHeadersComplete，然后调用parserOnIncoming。
 > 3.parserOnIncoming则触发一个“request”事件，接着调用业务代码中回调函数（即http.createServer入参函数）。
 
-###### requestListener的处理第一次读取
-这个回调函数requestListener，它有两个入参：req, res。
+###### requestListener 的处理过程
+1.回调函数requestListener是业务自己写的，如果仅仅处理get请求，那么直接这样写就行：
+```js
+// 处理get类型请求的requestListener写法
+const http = require('http');
+const server = http.createServer((req, res) => {
+  console.log('new request');
+  // 客户端的参数是在头部中的，可以直接在req上取到。
+  // 此时可以直接设置内容，并返回给客户端
+  res.end('Hello World');
+});
+server.listen(3000);
+```
 
-其中req，是/lib/_http_incoming.js中的IncomingMessage实例，并不是客户端实例（socket实例）。
+2.如果是post请求，那么怎么获取到客户端请求的body数据呢？（body数据在req上是拿不到的）
 
-然后在req下注册了一个data事件。
+为什么req上拿不到数据呢？因为客户端body数据有大有小，因此必须用stream（流）的方式来获取。
 
-由于req是一个readable stream实例，因此它的on方法是有特殊含义的，我们来看下
+下面我们直接展示方法：
+```js
+// 处理带有body的 requestListener 写法
+const http = require('http');
+const server = http.createServer((req, res) => {
+  console.log('new request');
+  // req是个流，通过注册data事件获取数据
+  req.on('data', (data) => {
+    console.log('data received');
+    res.end('Hello World');
+  })
+});
+server.listen(3000);
+```
+
+很清晰易懂吧，通过监听req这个流，来获取数据。
+
+可是仔细想想，这背后的过程是怎么样的呢？如果是一个超大的body，可能需要分多次传输。这些数据是怎么流转的呢？
+
+下面我们来详细解析一下。
+
+###### 某个req的body数据的流转过程。
+在上面的requestListener中，参数req，是/lib/_http_incoming.js中的IncomingMessage实例，并不是客户端实例（socket实例）。
+
+由于req是一个readable stream实例，因此它的on方法是有特殊含义的。在req下注册了一个data事件，会发生什么呢？
+
+我们来看下
 ```js
 //文件位置：/lib/_stream_readable.js
 Readable.prototype.on = function(ev, fn) {
@@ -694,7 +731,82 @@ Readable.prototype.on = function(ev, fn) {
 
 可以看到，除了调用Stream基类的on注册事件外，还额外调用了this.resume()。
 
-这个this.resume()会在下一个tick中，调用flow方法，触发stream.push(),最终触发“data”事件。(emit('data'))。
+这个this.resume()会在下一个tick中，调用flow方法。
+
+flow方法的关键在于一个无限循环，不断调用read方法来读取数据。
+
+```js
+// 文件地址：lib/_stream_readable.js
+function flow(stream) {
+  const state = stream._readableState;
+  debug('flow', state.flowing);
+  while (state.flowing && stream.read() !== null);
+}
+```
+
+stream.read方法，很重要，它的代码如下：
+
+```js
+// 文件地址：lib/_stream_readable.js
+Readable.prototype.read = function(n) {
+  ...
+  // 从stream的state的buffer中读取有多少字节数
+  n = howMuchToRead(n, state);
+  ...
+  if (state.ended || state.reading || state.destroyed || state.errored) {
+    ...
+  } else if (doRead) {
+    // 设置状态：state.reading = true 表示从底层资源获取数据；
+    // 获取完以后，会自动state.reading = false;(addChunk中可以看到)
+    state.reading = true;
+    ...
+    // 开始从底部资源读取数据，注意这个_read方法是不同业务场景提供的（比如req是_http_incoming.js提供的，fs读取流是/lib/internal/fs/stream.js提供的）
+    // 注意：这个方法可能是同步的，也可能是异步的。
+    // req中提供的_read什么也没做。
+    this._read(state.highWaterMark);
+    state.sync = false;
+    // If _read pushed data synchronously, then `reading` will be false,
+    // and we need to re-evaluate how much data we can return to the user.
+    if (!state.reading)
+      n = howMuchToRead(nOrig, state);
+  }
+
+  let ret;
+  if (n > 0)
+    ret = fromList(n, state);
+  else
+    ret = null;
+
+  if (ret === null) {
+    state.needReadable = state.length <= state.highWaterMark;
+    n = 0;
+  } else {
+    state.length -= n;
+    if (state.multiAwaitDrain) {
+      state.awaitDrainWriters.clear();
+    } else {
+      state.awaitDrainWriters = null;
+    }
+  }
+
+  if (state.length === 0) {
+    // If we have nothing in the buffer, then we want to know
+    // as soon as we *do* get something into the buffer.
+    if (!state.ended)
+      state.needReadable = true;
+
+    // If we tried to read() past the EOF, then emit end on the next tick.
+    if (nOrig !== n && state.ended)
+      endReadable(this);
+  }
+
+  if (ret !== null)
+    this.emit('data', ret);
+
+  return ret;
+};
+```
+触发stream.push(),最终触发“data”事件。(emit('data'))。
 
 我们知道，uv__read一次读取了64k大小的数据；所以如果请求中有body数据，那么这第一次读取，不仅读取了头部，还会读取部分或者全部的body数据。
 
@@ -774,3 +886,6 @@ nodejs服务只有一个主线程在处理逻辑;但是通过libuv loop循环，
 
 最后，我们把故事中的场景，放到nodejs的源码程序中，得到一张处理序列图，希望能够把nodejs抽象复杂的处理逻辑，变得直观一些。
 ![img 处理请求的调用次序图](./img/callSequence.png)
+
+另外一张是stream flow的过程图
+![img streamflow图](./img/stream_flow.png)
