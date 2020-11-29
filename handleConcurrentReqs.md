@@ -764,7 +764,6 @@ Readable.prototype.read = function(n) {
     // 注意：这个方法可能是同步的，也可能是异步的。
     // req中提供的_read什么也没做。
     this._read(state.highWaterMark);
-    state.sync = false;
     // If _read pushed data synchronously, then `reading` will be false,
     // and we need to re-evaluate how much data we can return to the user.
     if (!state.reading)
@@ -773,59 +772,28 @@ Readable.prototype.read = function(n) {
 
   let ret;
   if (n > 0)
+    // fromList就是从stream的state中的buffer读取数据
     ret = fromList(n, state);
   else
     ret = null;
-
-  if (ret === null) {
-    state.needReadable = state.length <= state.highWaterMark;
-    n = 0;
-  } else {
-    state.length -= n;
-    if (state.multiAwaitDrain) {
-      state.awaitDrainWriters.clear();
-    } else {
-      state.awaitDrainWriters = null;
-    }
-  }
-
-  if (state.length === 0) {
-    // If we have nothing in the buffer, then we want to know
-    // as soon as we *do* get something into the buffer.
-    if (!state.ended)
-      state.needReadable = true;
-
-    // If we tried to read() past the EOF, then emit end on the next tick.
-    if (nOrig !== n && state.ended)
-      endReadable(this);
-  }
-
+  ...
   if (ret !== null)
     this.emit('data', ret);
 
   return ret;
 };
 ```
-触发stream.push(),最终触发“data”事件。(emit('data'))。
 
-我们知道，uv__read一次读取了64k大小的数据；所以如果请求中有body数据，那么这第一次读取，不仅读取了头部，还会读取部分或者全部的body数据。
+> 总结一下stream.read：
+> 1. 调用背后的_read方法，将数据放到stream._readableState.buffer中
+> 2. 从buffer中读取数据，然后通过emit data将数据传输出去
+> 
+> 注：
+> 这个方法是公用的，因此逻辑需要兼容很多地方。
+比如可能buffer中已经有数据啦，即使_read没有读数据，本次读取也是可以有数据可处理的；同时，这个方法除了emit data，还会在函数末尾把数据return出去。
 
-因此，我们这里就立刻尝试通过this.resume()触发一次“data”事件。
 
-> 对应于故事中，王大妈的第一个纸条，信息量比较小，机器人一次就能读取完毕，知道王大妈需要采购“芝麻，1斤”。
-
-![img 图片](./img/bodyFirstRead.png)
-
-> 注：对应故事场景中，“机器人取字条到桌子上”这个动作，等同于nodejs中的uv__read动作，即从stream上读取一块64K大小的数据到buf中。
-###### requestListener的处理第二次及后续读取
-
-如果body数据过大，那么第一次读取只能读取一部分。接下来，会进行第二次，第三次读取（同样也是一次读取64k），直到把数据全部读取完毕。
-
-> 对应于故事中，王大妈的第三个请求，对西红柿的采购要求特别高，王大妈写了个非常长的字条，机器人一次读取不完。
-
-那么第二次，第三次等读取到64k，怎么触发“data”事件呢？
-
-我们来做一个实验，发送一个body大小为2Mb的请求。同时打断点，看下第二次读取数据后，解析器解析完成后，做了啥。
+我们知道，uv__read一次读取了64k大小的数据；那么这第一次读取，不仅读取了头部，还会读取部分或者全部的body数据。因此，llhttp解析完头部后，会继续解析，然后触发一个parserOnBody。证据如下：
 
 ![img 图片](./img/callOnBody.png)
 
@@ -870,15 +838,107 @@ function parserOnBody(b, start, len) {
   }
 }
 ```
-可以看到，这里最终调用了我们熟悉的stream.push(slice);  （stream.push会触发“data”事件）
+可以看到，这里最终调用了我们熟悉的stream.push(slice);  push方法会最终调用
+addChunk。
+```js
+function addChunk(stream, state, chunk, addToFront) {
+  if (state.flowing && state.length === 0 && !state.sync) {
+    // Use the guard to avoid creating `Set()` repeatedly
+    // when we have multiple pipes.
+    if (state.multiAwaitDrain) {
+      state.awaitDrainWriters.clear();
+    } else {
+      state.awaitDrainWriters = null;
+    }
+    stream.emit('data', chunk);
+  } else {
+    // Update the buffer info.
+    state.length += state.objectMode ? 1 : chunk.length;
+    if (addToFront)
+      state.buffer.unshift(chunk);
+    else
+      state.buffer.push(chunk);
+
+    if (state.needReadable)
+      emitReadable(stream);
+  }
+  maybeReadMore(stream, state);
+}
+```
+
+在req第一段body数据到来时，此处会走到else分支，即仅仅是往stream._readableState.buffer中存放数据，等会下次处理。
+
+那么什么时候处理呢？
+
+>在前面我们分析到，当解析完头部后，会创建一个req，同时设置req.on('data'), 这个on方法会调用resume。这里的resume会在下一个tick中，调用flow方法。
+
+于是，这里就是那个“nextTick”，即调用flow方法。此时buffer中已经有了数据，因此flow中的read方法，便可以直接读取，并触发emit data事件。
+
+不过此处的flow中的无限循环read只会运行一次，后续就没有了。因为stream._readableState.buffer中已经没有数据，并且_http_incoming的提供的_read方法也没有读取数据，源码中有解释：
+```js
+IncomingMessage.prototype._read = function _read(n) {
+  if (!this._consuming) {
+    this._readableState.readingMore = false;
+    this._consuming = true;
+  }
+
+  // We actually do almost nothing here, because the parserOnBody
+  // function fills up our internal buffer directly.  However, we
+  // do need to unpause the underlying socket so that it flows.
+  if (this.socket.readable)
+    readStart(this.socket);
+};
+```
+
+注意这段注释：【We actually do almost nothing here, because the parserOnBody function fills up our internal buffer directly】
+
+意思是，_http_incoming提供的_read不会真的从底部读取数据，因为uv__io_poll会自动触发。
+
+我们来看下证据：
+
+我们知道，有数据到来时，会走一下流程：uv_read--> read_cb-->llhttp -->parserOnBody-->stream.push-->addChunk。
+
+又到了addChunk。此次会走if分支，直接将数据emit出去。
+```js
+function addChunk(stream, state, chunk, addToFront) {
+  if (state.flowing && state.length === 0 && !state.sync) {
+    // Use the guard to avoid creating `Set()` repeatedly
+    // when we have multiple pipes.
+    if (state.multiAwaitDrain) {
+      state.awaitDrainWriters.clear();
+    } else {
+      state.awaitDrainWriters = null;
+    }
+    stream.emit('data', chunk);
+  } else {
+    // Update the buffer info.
+    state.length += state.objectMode ? 1 : chunk.length;
+    if (addToFront)
+      state.buffer.unshift(chunk);
+    else
+      state.buffer.push(chunk);
+
+    if (state.needReadable)
+      emitReadable(stream);
+  }
+  maybeReadMore(stream, state);
+}
+```
+
+
 
 ![img 图片](./img/bodyAfterFirst.png)
 > 小结：
-> 1.对于大body类型的请求，第一次读取64k数据，其中的body部分，会通过this.resume()，调用flow方法，触发stream.push(),最终触发“data”事件。(emit('data'))；
+> 1.对于大body类型的请求，第一次读取64k数据，其中的body部分，会通过this.resume()，调用flow方法，最终触发“data”事件。(emit('data'))；
 > 
 > 2.后续第二次，第三次，会通过node_http_parser.cc中的on_body来调用stream.push(slice)，最终触发“data”事件。
 
 到此，我们就知道了，对于一个用户内的不同请求，是通过llhttp解析器来区分不同的请求的。
+
+
+> 对应于故事中，王大妈的第一个纸条，信息量比较小，机器人一次就能读取完毕，知道王大妈需要采购“芝麻，1斤”。
+
+![img 图片](./img/bodyFirstRead.png)
 
 # 四.总结：
 
