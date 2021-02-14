@@ -66,7 +66,7 @@
 * 机器人完成采购，放到“蓝色篮子里”，客户离开。
 
 ## 1.原理分析
-我们再第一章中分析了nodejs服务启动后，通过net.createServer()创建了一个libuv服务实例（背后绑定了一个socket）。这个服务实例，就对应故事中的“红色篮子”。
+我们在第一章中分析了nodejs服务启动后，通过net.createServer()创建了一个libuv服务实例（背后绑定了一个socket）。这个服务实例，就对应故事中的“红色篮子”。
 然后把这个服务实例下的观察者（watcher）注册到libuv loop下的watcher_queue队列中；这个动作类似于故事中“红色篮子”上方安装一个探测器，实时探测“红色篮子”的变化。
 
 等有客户端通过三次握手，建立一个tcp链接后，nodejs服务会建立一个libuv客户端实例（背后也绑定了一个socket）。这个客户端实例，就类似于故事中的“蓝色篮子”。
@@ -75,9 +75,9 @@
 ## 2.关联
 我们来看下这个故事情节中的事物，和nodejs服务器之间的关联：
 
-* 王大妈    -->  TCP 通信链接
+* 王大妈    --> 用户访问服务，所建立的tcp链接
 * 黄豆，2斤 --> body：{material: "黄豆", number: "2斤"}
-* 机器人   --> nodejs主线程
+* 机器人   --> nodejs主线程（libuv）
 * 红色篮子 --> libuv服务实例（对应一个socket）,负责监听是否有新的tcp握手请求。
 * 蓝色篮子 --> 在服务器端为每一个用户创建一个libuv客户端实例（对应一个socket），用于和客户端进行数据通信。
 
@@ -126,7 +126,7 @@ int uv_run(uv_loop_t* loop, uv_run_mode mode) {
 ```
 
 是不是很熟悉，其实就是libuv官网中的这张图
-![alt 图片](../../img/uv_run.png)
+![alt 图片](./img/libuv_uv_run.png)
 
 我们重点关注uv__io_poll，这个节段就是处理一个tcp请求的核心所在。
 
@@ -154,7 +154,6 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
   // 4.开启一个无限循环，监听epoll
   for (;;) {
     ...
-    // todo 断点确定一下epoll_wait是否是走这个分支
       // 4.1.调用epoll_wait，获取有请求到来的服务实例
       nfds = epoll_wait(loop->backend_fd, events, ARRAY_SIZE(events), timeout);
     ...
@@ -256,7 +255,9 @@ void uv__server_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
 }
 ```
 
-这段代码有两个重要的函数调用： uv__accept(uv__stream_fd(stream)),stream->connection_cb(stream, 0)。
+这段代码有两个重要的函数调用： 
+* uv__accept(uv__stream_fd(stream))
+* stream->connection_cb(stream, 0)。
 
 这两个函数加起来，作用如下：
 * 创建一个客户端实例，类似于分配一个“蓝色篮子”
@@ -374,8 +375,6 @@ function setupListenHandle(address, port, addressType, backlog, fd, flags) {
 ```
 这里有一行代码“this._handle.onconnection = onconnection;”
 
-// todo wrap_data->MakeCallback解读
-
 即把net.js中的onconnection函数，赋给了this._handle；这里的this._handle就是我们的服务器实例。
 > 小结：
 > 服务实例有客户端请求时，创建一个客户端socket，然后调用net.js中的onconnection
@@ -407,7 +406,7 @@ onconnection比较简单，做了两件事：
 创建Socket实例的过程非常重要，也就是在这里，把新建的libuv客户端实例交给了libuv管理。
 
 我们来看下Socket这个构建函数：
-在Socket初始化的时候，又调用一个read,不过指明读取0个长度
+在Socket初始化的时候，有调用一个read,不过指明读取0个长度
 ```js
 // 文件地址：/lib/net.js
 // options.handle就是clientHandle
@@ -426,7 +425,6 @@ function Socket(options) {
 // 文件地址：/lib/_stream_readable.js
 Readable.prototype.read = function(n) {
   ...
-  // todo 断点调试，read(0)
   this._read(state.highWaterMark);
 }
 ```
@@ -573,11 +571,11 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 
 * 无论是libuv服务实例，还是libuv客户端实例，nodejs都会基于stream类进行封装，二者本质上没什么差别。
 
-* 一个普通的stream，w->cb是指cb，就是指uv__stream_io；
+* 一个普通的stream，w->cb就是指uv__stream_io；
   
 * 如果是服务实例，会额外调用listen。listen过程中（uv_tcp_listen）会用uv__server_io覆盖w->cb。
 
-客户端通信时，由于w->cb没有被覆盖，所以此时的w->cb就是 v__stream_io。
+客户端通信时，由于w->cb没有被覆盖，所以此时的w->cb就是 uv__stream_io。
 ### 2.8 uv__stream_io
 
 ```c++
