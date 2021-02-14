@@ -696,7 +696,7 @@ function parserOnBody(b, start, len) {
 
 > 如果body比较大，uv__read一次读取64k后，没读完，将会继续读取下去，（参见“2.4.3 调用解析器”中uv__read函数中的while循环），触发parserOnBody，往stream中不断添加数据（stream.push(slice)）。
 
-### 2.6 一个完整的请求处理流程
+### 2.6 汇总：一个完整的请求处理流程
 到此，我们知道了一个nodejs服务是如何“识别用户”，“识别请求”的原理了。
 
 尤其是“识别请求”，nodejs引入了解析器（llhttp）,将一个请求分为头部和body分别解析。
@@ -764,7 +764,7 @@ server.listen(3000);
 
 > 到这里，完成了以下流程：
 > 请求到来--> 解析头部--> 调用业务回调
-#### 2.6.2 处理业务回调（requestListener）
+#### 2.6.2 处理业务回调
 业务回调requestListener是业务自己写的。也就是说，这里便开始执行业务的代码了。
 ```js
 // 处理get类型请求的requestListener写法
@@ -796,6 +796,8 @@ const server = http.createServer((req, res) => {
   // req是个流，通过注册data事件获取数据
   req.on('data', (data) => {
     console.log('data received');
+    ...// 更多业务处理逻辑
+  }).on('end', () => {
     res.end('Hello World');
   })
 });
@@ -851,7 +853,7 @@ function resume_(stream, state) {
 
 也就是说，在这里发生了一次c++/js边界穿越；一般情况下，完成一次边界穿越，js调用栈就清理了一次；
 
-js调用栈清理后，紧接着就回进行任务队列的清理（即清理tick队列和microtask队列）。
+js中有一个基础概念：js调用栈清理后，紧接着就回进行任务队列的清理（即清理tick队列和microtask队列）。
 
 按道理，nodejs解析完头部，并且执行完业务回调代码（js）后，便会清理tick队列，也就是会执行resume_，调用flow。
 
@@ -900,14 +902,18 @@ void InternalCallbackScope::Close() {
 
 此时的skip_task_queues_为true，因此解析完头部后，调用js业务代码后，暂时跳过清理任务队列。
 
-那么什么时候调用呢？
-#### 2.6.4 解析body，清理任务队列
+那么这里放到tick队列的回调，只能等到下一次c++/js穿越后，才能有机会被执行。
+
+我们知道，llhttp解析器解析完头部后，将会解析body。解析一部分body后，将会触发js回调，即发生了一次c++/js穿越，机会就在这里。
+
+#### 2.6.4 解析body的第一部分，清理任务队列
 
 在“2.5.2”小节中，我们知道，解析器解析一段body后，触发了parserOnBody，最终调用了stream.push(slice);
 
 push方法会最终调用
 addChunk。
 ```js
+// 文件位置：/lib/_stream_readable.js
 function addChunk(stream, state, chunk, addToFront) {
   if (state.flowing && state.length === 0 && !state.sync) {
     ...
@@ -928,7 +934,7 @@ function addChunk(stream, state, chunk, addToFront) {
 
 在req第一段body数据到来时，此处会走到else分支，即仅仅是调用state.buffer.push(chunk)，往stream._readableState.buffer中存放数据，等会下次处理。
 
-到这里为止，又完成了一次c++/js边界穿越，只不过这次穿越是通过MakeCallback完成的。我们断定，这里将会有一次任务队列的清理的机会。我们看代码：
+这里，发生了一次c++/js边界穿越，只不过这次穿越是通过MakeCallback完成的。我们断定，这里将会有一次任务队列的清理的机会。我们看代码：
 
 ```c++
 // 文件位置：/src/api/callback.cc
@@ -982,7 +988,7 @@ void InternalCallbackScope::Close() {
 }
 
 ```
-env_->tick_callback_function为什么是processTicksAndRejections呢？我们来看下:
+env_->tick_callback_function为什么是 processTicksAndRejections 呢？我们来看下:
 在task_queue.js中，执行以下代码
 ```js
 // 文件位置：/lib/internal/process/task_queue.js
@@ -1004,6 +1010,34 @@ static void SetTickCallback(const FunctionCallbackInfo<Value>& args) {
   env->set_tick_callback_function(args[0].As<Function>());
 }
 ```
+
+processTicksAndRejections将会首先清理tick队列，然后清理microtask队列
+```js
+// 文件位置：/lib/internal/process/task_queue.js
+function processTicksAndRejections() {
+  let tock;
+  ...
+    // 进入循环，先从tick队列取一个任务
+    while (tock = queue.shift()) {
+      ...
+
+      try {
+        const callback = tock.callback;
+        ...
+        // 1. 执行回调
+        callback();// 这里有比较复杂的调用，这里简写
+      } finally {
+        ...
+      }
+
+      ...
+    }
+    // 2.清理microtask
+    runMicrotasks();
+  ...
+}
+```
+
 因此，这里开始清理2.6.2小节中往往tick队列中设置的回调（process.nextTick(resume_, stream, state);）
 
 #### 2.6.5 执行任务队列的回调函数
@@ -1012,7 +1046,7 @@ static void SetTickCallback(const FunctionCallbackInfo<Value>& args) {
 
 resume_会调用flow方法。此时stream的buffer中已经有了数据。
 
-flow方法的关键在于一个无限循环，不断调用read方法来读取数据。
+flow方法的关键在于一个无限循环，不断调用read方法，从stream的buffer中来读取数据。
 
 ```js
 // 文件地址：lib/_stream_readable.js
@@ -1022,8 +1056,7 @@ function flow(stream) {
   while (state.flowing && stream.read() !== null);
 }
 ```
-
-stream.read方法，很重要，它的代码如下：
+stream.read方法，代码如下：
 
 ```js
 // 文件地址：lib/_stream_readable.js
@@ -1064,10 +1097,11 @@ Readable.prototype.read = function(n) {
 ```
 
 总结一下stream.read：
-1. 调用背后的_read方法，将数据放到stream._readableState.buffer中
-2. 从buffer中读取数据，然后通过this.emit('data', ret);将数据传输出去
+1. 调用背后的_read方法。将数据放到stream._readableState.buffer中
+>注意：req这个stream的_read方法比较特殊，不会往buffer中放数据（它是在parserOnBody中往buffer中放的，参见2.6.4小节开始的一段代码解读）。
+2. 从buffer中读取数据，然后通过this.emit('data', ret);将数据传输出去。
 
-还记得业务代码中曾经在请求上注册过on('data')事件吗？这里就会触发它的执行。
+还记得业务代码中曾经在请求上注册过on('data')事件吗？这里就会触发它。
 
 ```js
 //业务代码
@@ -1077,58 +1111,74 @@ const server = http.createServer((req, res) => {
   // req是个流，通过注册data事件获取数据
   req.on('data', (data) => {
     console.log('data received');
+    ...// 更多业务逻辑
+  }).on('end', () => {
     res.end('Hello World');
   })
 });
 server.listen(3000);
 ```
 
-到这里，便完成了body数据一遍解析，一遍触发业务回调的整体流程。
+到这里，便完成了body数据“一边解析，一边触发业务回调”的整体流程。
 
+> req可以监听一个end事件，当解析器最终解析完body后，便会触发on_message_complete回调,最终调用_http_common.js中的parserOnMessageComplete函数：
+> ```js
+> // For emit end event
+>    stream.push(null);
+> ```
+> parserOnMessageComplete通过stream.push(null)，传入一个null，来触发一个end事件。
 
-> 注：这个方法是公用的，因此逻辑需要兼容很多地方。
-比如可能buffer中已经有数据啦，即使_read没有读数据，本次读取也是可以有数据可处理的；同时，这个方法除了emit data，还会在函数末尾把数据return出去。
+这里有一个地方需要注意，flow方法中，无限循环调用read只会执行一次。
 
+```js
+// 文件地址：lib/_stream_readable.js
+function flow(stream) {
+  const state = stream._readableState;
+  debug('flow', state.flowing);
+  while (state.flowing && stream.read() !== null);
+}
+```
+因为stream._readableState.buffer中已经没有数据，stream.read()会返回null。
 
-> 不过此处的flow中的无限循环read只会运行一次，后续就没有了。因为stream._readableState.buffer中已经没有数据，并且_http_incoming的提供的_read方法也没有读取数据，源码中有解释：
+此时你可能会问，read内部不是有一个_read方法从底层获取数据吗？（一般情况下_read确实是会不断填充stream的buffer）
+
+然而，_http_incoming的提供的_read方法比较特殊，它并没有从底层读取数据，源码中有解释：
 ```js
 IncomingMessage.prototype._read = function _read(n) {
-  if (!this._consuming) {
-    this._readableState.readingMore = false;
-    this._consuming = true;
-  }
-
-  // We actually do almost nothing here, because the parserOnBody
-  // function fills up our internal buffer directly.  However, we
-  // do need to unpause the underlying socket so that it flows.
-  if (this.socket.readable)
-    readStart(this.socket);
-};
+   if (!this._consuming) {
+     this._readableState.readingMore = false;
+     this._consuming = true;
+   }
+ 
+   // We actually do almost nothing here, because the parserOnBody
+   // function fills up our internal buffer directly.  However, we
+   // do need to unpause the underlying socket so that it flows.
+   if (this.socket.readable)
+     readStart(this.socket);
+ };
 ```
 
->注意这段注释：【We actually do almost nothing here, because the parserOnBody function fills up our internal buffer directly】
->
->意思是，_http_incoming提供的_read不会真的从底部读取数据，因为uv__io_poll会自动触发。
+注意这段注释：【We actually do almost nothing here, because the parserOnBody function fills up our internal buffer directly】
+ 
+意思是，_http_incoming提供的_read不会真的从底部读取数据，因为uv__io_poll会自动触发。
 
+既然_http_incoming提供的_read不处理，那么body如果还有数据，那么怎么继续处理呢？
 
+我们接着看。
 
-可是仔细想想，这背后的过程是怎么样的呢？如果是一个超大的body，可能需要分多次传输。这些数据是怎么流转的呢？
+#### 2.6.6 解析请求body的剩余部分
 
-下面我们来详细解析一下。
+当请求body较大时，一次解析（uv__read中，一次读取64k大小）可能完不成，需要触发多次解析。
 
-###### req的body数据的流转过程。
+在上两节中，我们了解了解析请求body第一部分的处理流程。那接下来的body解析是怎么样的流程呢？
 
+我们知道，有数据到来时，会走以下流程：uv_read--> read_cb-->llhttp -->parserOnBody-->stream.push-->addChunk。
 
+又到了addChunk。addChunk函数就是一个if else。
 
-##fasdfasd
-
-
-我们来看下证据：
-
-我们知道，有数据到来时，会走一下流程：uv_read--> read_cb-->llhttp -->parserOnBody-->stream.push-->addChunk。
-
-又到了addChunk。此次会走if分支，直接将数据emit出去。
+因为头部解析完成后，已经触发了flow方法（即调用resume_）,stream处于流动中，此次会走if分支，直接将数据emit出去。
 ```js
+// 文件位置：/lib/_stream_readable.js
 function addChunk(stream, state, chunk, addToFront) {
   if (state.flowing && state.length === 0 && !state.sync) {
     // Use the guard to avoid creating `Set()` repeatedly
@@ -1154,24 +1204,14 @@ function addChunk(stream, state, chunk, addToFront) {
 }
 ```
 
+也就是说，剩下的body解析，将会直接emit一个data事件，触发业务代码回调。
+
+到此，一个完整的请求解析+处理回调完成。
 
 
-![img 图片](./img/bodyAfterFirst.png)
-> 小结：
-> 1.对于大body类型的请求，第一次读取64k数据，其中的body部分，会通过this.resume()，调用flow方法，最终触发“data”事件。(emit('data'))；
-> 
-> 2.后续第二次，第三次，会通过node_http_parser.cc中的on_body来调用stream.push(slice)，最终触发“data”事件。
+# 四.总结
 
-到此，我们就知道了，对于一个用户内的不同请求，是通过llhttp解析器来区分不同的请求的。
-
-
-> 对应于故事中，王大妈的第一个纸条，信息量比较小，机器人一次就能读取完毕，知道王大妈需要采购“芝麻，1斤”。
-
-![img 图片](./img/bodyFirstRead.png)
-
-# 四.总结：
-
-nodejs服务只有一个主线程在处理逻辑;但是通过libuv loop循环，精确区分每一个用户；同时通过http解析器区分同一个用户下的不同请求。最终实现处理并发请求的能力。
+nodejs服务只有一个主线程在处理逻辑;但是通过libuv loop循环，精确区分每一个用户；同时通过http解析器（llhttp）区分同一个用户下的不同请求。最终实现处理并发请求的能力。
 
 最后，我们把故事中的场景，放到nodejs的源码程序中，得到一张处理序列图，希望能够把nodejs抽象复杂的处理逻辑，变得直观一些。
 ![img 处理请求的调用次序图](./img/callSequence.png)
