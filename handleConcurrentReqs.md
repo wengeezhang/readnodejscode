@@ -282,7 +282,7 @@ const server = net.createServer((c) => {
 
 > 总结：针对不同的请求类型，判断请求结束标识符，便可以区分各个请求。
 
-### 2.3 http解析器的基本概念和作用
+### 2.3 引入http解析器
 
 从2.2.1和2.2.2小节中，我们大概知道了怎么区分多个请求的边界。但是如果要真的实现起来，将会非常复杂。
 如果这种事情nodejs不提供原生的模块来处理，而是交给业务开发人员自己去判断，那么nodejs将会无人问津，无法流行起来。
@@ -830,7 +830,22 @@ Readable.prototype.on = function(ev, fn) {
 
 可以看到，除了调用Stream基类的on注册事件外，还额外调用了this.resume()。
 
-这个this.resume()会在下一个tick中，调用flow方法。
+```js
+//文件位置：/lib/_stream_readable.js
+Readable.prototype.resume = function() {
+  const state = this._readableState;
+  if (!state.flowing) {
+    ...
+    state.flowing = !state.readableListening;
+    resume(this, state);
+  }...
+};
+```
+this.resume的作用有两个：
+* 将stream状态设置为流动状态(state.flowing = !state.readableListening;)
+* 调用另外一个独立函数resume，在下一个tick中启动flow
+
+附上独立函数resume代码：
 ```js
 // 文件位置：/lib/_stream_readable.js
 function resume(stream, state) {

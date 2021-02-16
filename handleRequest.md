@@ -57,11 +57,11 @@
 
 如果确定了“客人要买东西，而且知道了要买什么”，那么剩下的工作就非常“迅速”，夸张一点说，基本不用浪费时间（这个概念希望读者记一下）。
 
-因此，基于这个分析，“10010百货铺”的运营模式就成了上线故事情节中的那样：
+因此，基于这个分析，“10010百货铺”的运营模式就成了上面故事情节中的那样：
 
 * 只有一个机器人
 * 客人到店后，如果确定要买东西，就写上自己的名字，放到“红色篮子”里，如果不买，就不用写。
-* 机器人检测到有人要买东西，就给他/她分配一个“蓝色篮子”
+* 机器人检测到有人要买东西，就给ta分配一个“蓝色篮子”
 * 客人再把自己的采购需求放到“蓝色篮子”里
 * 机器人完成采购，放到“蓝色篮子里”，客户离开。
 
@@ -131,8 +131,10 @@ int uv_run(uv_loop_t* loop, uv_run_mode mode) {
 我们重点关注uv__io_poll，这个节段就是处理一个tcp请求的核心所在。
 
 ## 2. 源码解读
-### 2.1 uv__io_poll
-uv__io_poll封装了平台的差异性（linux下使用epoll， mac下使用kqueue, windows下是iocp）。我们以linux的epoll为例来解读。
+### 2.1 检测新用户到来
+>这里对应于故事中，红色篮子上面的监控器，监控篮子里是否有纸条，是否有顾客到来。
+
+uv__io_poll 封装了平台的差异性（linux下使用epoll， mac下使用kqueue, windows下是iocp）。我们以linux的epoll为例来解读。
 
 ```c++
 // 文件地址：/deps/uv/src/unix/linux-core.c
@@ -177,10 +179,10 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 我们把以上代码中的注释集中起来,看一下uv__io_poll的工作流程：
 * 1.设置一堆必要的变量
 * 2.从loop下的watcher_queue依次取出一个观察者对象（在上一章节nodejs服务启动时，曾经创建了一个服务实例，并把该服务实例的观察者挂载到了loop->watcher_queue下）
-* 3.注册到epoll中
-* 4.开启一个无限循环，监听epoll
+* 3.把刚才的观察者注册到epoll中
+* 4.开启一个无限循环，监听观察者
   * 4.1 调用epoll_wait，获取有请求到来的服务实例
-  * 4.2.依次调用回调函数：w->cb
+  * 4.2.依次调用回调函数（w->cb）
 
 > 注：为了简单易懂，以上分析仅仅以tcp请求为例。
 
@@ -208,8 +210,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 
 > 对照关联：
 > 回忆一下故事情节中的“红色篮子”的作用。我们的服务实例的观察者对象（tcp->io_watcher）就相当于故事中的“红色篮子”。
-### 2.2 w->cb
-
+### 2.2 用户到来后，创建libuv客户端实例
 在上一节中，在有tcp连接建立时，程序调用了w->cb。这个回调函数cb是什么呢？
 
 在第一章中，服务启动时，我们分析了listen最终调用了uv_tcp_listen。我们这里再把那段代码贴出来看看
@@ -217,20 +218,11 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 // 文件地址： /deps/uv/src/unix/tcp.c
 int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
   ...
-  if (listen(tcp->io_watcher.fd, backlog))
-    return UV__ERR(errno);
-
-  tcp->connection_cb = cb;
-  tcp->flags |= UV_HANDLE_BOUND;
-  ...
   // 设置cb = uv__server_io
   tcp->io_watcher.cb = uv__server_io;
-  uv__io_start(tcp->loop, &tcp->io_watcher, POLLIN);
-
-  return 0;
+  ...
 }
 ```
-> 注：stream->connection_cb的stream和tcp->connection_cb的tcp是一个东西。
 
 看看上面代码中的有注释的那一行代码（tcp->io_watcher就是本章节分析中的w），可以看出：
 
@@ -239,8 +231,9 @@ int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
 > 小结：
 > 有tcp连接建立时，程序会调用uv__server_io。
 
-在故事中，当机器人检测到有人往“红色篮子”里放字条时，机器人分配了一个“蓝色篮子”，并安装了一个探测器。那么接下来nodejs程序也会执行类似的两个操作。
+>在故事中，当机器人检测到有人往“红色篮子”里放字条时，机器人分配了一个“蓝色篮子”，并安装了一个探测器。那么接下来nodejs程序也会执行类似的两个操作。
 
+#### 2.2.1 为新来的用户创建底层socket
 uv__server_io是stream.c中的一个方法，我们来看下它的代码：
 ```js
 // 文件地址：/src/deps/uv/src/unix/stream.c
@@ -259,21 +252,15 @@ void uv__server_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
 * uv__accept(uv__stream_fd(stream))
 * stream->connection_cb(stream, 0)。
 
-这两个函数加起来，作用如下：
-* 创建一个客户端实例，类似于分配一个“蓝色篮子”
-* 将客户端实例的观察者（watcher）注册到libuv loop的watcher_queue中，类似于给“蓝色篮子”安装探测器
+
 
 首先看uv__accept(uv__stream_fd(stream))：
 
 这行代码表示，接受客户端请求，在底层创建一个socket（并把新创建的socket的fd，临时保存在服务实例下）
 
+#### 2.2.2 创建libuv客户端实例
 然后再看stream->connection_cb(stream, 0)：
 
-这行代码，会把新创建的客户端socket，进行封装，并交给libuv观测。
-
-我们来看下stream->connection_cb这个函数，是怎么把新创建的客户端socket封装，并注册到libuv下的。
-
-### 2.3 stream->connection_cb
 
 首先看下stream->connection_cb到底是什么。
 回顾第一章中，监听端口的代码：
@@ -295,36 +282,19 @@ int uv_listen(uv_stream_t* stream, int backlog, uv_connection_cb cb) {
   ...
 }
 
-```
-
-可以看到，它调用了uv_listen，并传入了一个参数OnConnection,然后参数传递给uv_tcp_listen。
-
-```C++
 // 文件： /deps/uv/src/unix/tcp.c
 int uv_tcp_listen(uv_tcp_t* tcp, int backlog, uv_connection_cb cb) {
   ...
-  if (listen(tcp->io_watcher.fd, backlog))
-    return UV__ERR(errno);
-
   tcp->connection_cb = cb;
-  tcp->flags |= UV_HANDLE_BOUND;
   ...
-  tcp->io_watcher.cb = uv__server_io;
-  uv__io_start(tcp->loop, &tcp->io_watcher, POLLIN);
-
-  return 0;
 }
 ```
 
-在这里，我们看到，tcp->connection_cb = cb;  这里的cb就是uv_listen(reinterpret_cast<uv_stream_t*>(&wrap->handle_),backlog,OnConnection)中的OnConnection。
 
-> 小结：
-> 收到客户端请求后，创建一个客户端socket，然后调用stream.connection_cb。
-> stream.connection_cb就是OnConnection
+在这里，我们看到，tcp->connection_cb = cb;  这里的cb就是uv_listen的参数OnConnection。
 
 > 注：stream->connection_cb的stream和tcp->connection_cb的tcp是一个东西。
 
-### 2.4 OnConnection
 OnConnection是/src/connection_wrap.cc下的一个函数，代码如下：
 
 ```c++
@@ -332,6 +302,7 @@ OnConnection是/src/connection_wrap.cc下的一个函数，代码如下：
 void ConnectionWrap<WrapType, UVType>::OnConnection(uv_stream_t* handle,int status) {
   ...
     ...
+    // 创建一个libuv客户端实例
     uv_stream_t* client = reinterpret_cast<uv_stream_t*>(&wrap->handle_);
     // 注意这里是uv_accept，和之前的uv__accept不同。
     if (uv_accept(handle, client))
@@ -344,48 +315,38 @@ void ConnectionWrap<WrapType, UVType>::OnConnection(uv_stream_t* handle,int stat
   wrap_data->MakeCallback(env->onconnection_string(), arraysize(argv), argv);
 }
 ```
-这里的代码比较晦涩难懂，不过我们来简要概括一下：
+这里的代码简要概括一下：
 * 新建一个libuv 客户端实例对象。
 * uv_accept(handle, client)： 给新建的客户端实例对象设置fd（即关联背后的socket）。只有关联了fd，才能交给libuv管理。
   > 在2.2节中，我们有分析到，新创建的socket的fd临时保存在了服务实例下（stream->accepted_fd = err，err就是新的socket的fd, stream就是这里的handle。）（变量命名的跳跃性，是读者面临的困扰之一）
 * wrap_data->MakeCallback(env->onconnection_string(), arraysize(argv), argv)：
   把客户端实例对象，作为参数，传给net.js中的onconnection
 
-那么用户可能会问：
-为什么说MakeCallback(env->onconnection_string()），就是调用net.js中的onconnection函数呢？
+> 为什么说MakeCallback(env->onconnection_string()），就是调用net.js中的onconnection函数呢？
+>
+>在第一章2.2.1小节中，分析启动服务时，有解读过以下代码：
+>```js
+>// 文件： /lib/net.js
+>function setupListenHandle(...) {
+>  ...
+>  this._handle.onconnection = onconnection;
+>  ...
+>}
+>```
+>
+>即把net.js中的onconnection函数，赋给了this._handle；这里的this._handle就是我们的服务器实例。
 
-带着这个问题，我们来继续分析。
-
-在第一章2.2.1小节中，分析启动服务时，有解读过以下代码：
-```js
-// 文件： /lib/net.js
-function setupListenHandle(address, port, addressType, backlog, fd, flags) {
-  ...
-      rval = createServerHandle(address, port, addressType, fd, flags);
-    ...
-    this._handle = rval;
-  ...
-
-  this._handle.onconnection = onconnection;
-  ...
-  const err = this._handle.listen(backlog || 511);
-
-  ...
-}
-```
-这里有一行代码“this._handle.onconnection = onconnection;”
-
-即把net.js中的onconnection函数，赋给了this._handle；这里的this._handle就是我们的服务器实例。
 > 小结：
 > 服务实例有客户端请求时，创建一个客户端socket，然后调用net.js中的onconnection
 
-### 2.5 net.js中的onconnection
-
+### 2.3 将客户端实例，注册到libuv下监测起来。
+#### 2.3.1 封装socket(js)，指向客户端实例(c++)
+现在任务转交给net.js中的onconnection。先看这个函数的第一部分。
 ```js
 // 文件地址：/lib/net.js
 function onconnection(err, clientHandle) {
   ...
-  // 封装一个Socket实例对象（该socket是更高级别封装，供js使用）
+  // 第一部分：封装一个Socket实例对象（该socket是更高级别封装，供js使用）
   const socket = new Socket({
     handle: clientHandle,
     allowHalfOpen: self.allowHalfOpen,
@@ -394,19 +355,12 @@ function onconnection(err, clientHandle) {
     writable: true
   });
   ...
-  self.emit('connection', socket);
+  // 第二部分：暂时省略（在下一节2.4中展开）
 }
 ```
 > 注：从上面代码中，我们看到，新封装的Socket实例对象，其handle指向了clientHandle，实现了对C++世界中client socket的关联。
 
-onconnection比较简单，做了两件事：
-* 创建一个Socket实例
-* 触发connection事件，传入刚刚创建的socket对象。
-
-触发connection后，将会直接执行业务回调，业务回调
-调用了on('data'),将stream启动。
-
-创建Socket实例的过程非常重要，也就是在这里，把新建的libuv客户端实例交给了libuv管理。
+创建Socket实例的过程非常重要，也就是在这里，隐性地把新建的libuv客户端实例交给了libuv管理。
 
 我们来看下Socket这个构建函数：
 在Socket初始化的时候，有调用一个read,不过指明读取0个长度
@@ -421,8 +375,8 @@ function Socket(options) {
   this.read(0);
 }
 ```
-
-由于socket继承了Stream，因此这里的read是Stream下的一个方法；由于是读取，因此我们去/lib/_stream_readable.js中找到read方法。
+![初始化Socket，启动读取](./img/netSocketInitReadStart.png)
+由于socket继承了Stream，因此这里的read是Stream下的一个方法；我们去/lib/_stream_readable.js中找到read方法：
 
 ```js
 // 文件地址：/lib/_stream_readable.js
@@ -431,7 +385,7 @@ Readable.prototype.read = function(n) {
   this._read(state.highWaterMark);
 }
 ```
-而这个this._read就是net.js中构建函数Socket的一个原型链方法
+它调用了this._read，即net.js中构建函数Socket的一个原型链方法
 
 ```js
 // 文件地址：/lib/net.js
@@ -449,7 +403,8 @@ function tryReadStart(socket) {
 }
 ```
 
-可以看到，这里最终调用了socket._handle.readStart。Socket构建函数中“this._handle = options.handle;”，表明了_handle是options.handle；而options.handle就是clientHandle。
+可以看到，这里最终调用了socket._handle.readStart。
+> 这里的socket._handle就是clientHandle。
 
 > 小结：
 > libuv服务实例收到客户端请求后，创建一个libuv客户端实例。
@@ -457,7 +412,7 @@ function tryReadStart(socket) {
 > Socket构建函数在初始化时，调用了libuv客户端实例的readStart方法。
 
 
-### 2.6 libuv客户端实例的ReadStart方法
+#### 2.3.2 客户端实例启动
 ```C++
 // 文件地址：/src/stream_wrap.cc
 int LibuvStreamWrap::ReadStart() {
@@ -470,7 +425,7 @@ int LibuvStreamWrap::ReadStart() {
   });
 }
 ```
-> 注意这里，uv_read_start的第2，3个参数，都是函数。在uv_read_start代码中，将会被分别赋给stream->read_cb， stream->alloc_cb
+> 注意这里，uv_read_start的第2，3个参数，都是函数。在uv_read_start代码中，将会被分别赋给stream->alloc_cb, stream->read_cb;
 
 我们来看看uv_read_start的逻辑。
 
@@ -486,19 +441,105 @@ int uv_read_start(uv_stream_t* stream, uv_alloc_cb alloc_cb, uv_read_cb read_cb)
   ...
 }
 ```
-uv__io_start我们就比较清晰了，它就是把libuv客户端实例的观察者（io_watcher）挂载到libuv的loop下的watcher_queue中，以便在uv__io_poll阶段，被epoll关注。
+uv__io_start我们就比较清晰了（参见上一章），它就是把libuv客户端实例的观察者（io_watcher）挂载到libuv的loop下的watcher_queue中，以便在uv__io_poll阶段，被epoll监测。
 
 到此为止，libuv客户端实例算是成功注册到libuv中啦。
 
 > 对比故事中的情节，机器人给王大妈的“蓝色篮子”放置好了探测器。
 
-### 2.7 tcp连接建立后，开始接收客户端传输的数据
+### 2.4 执行业务回调
+#### 2.4.1 业务回调函数分析
+在上一节2.3中，我们分析了net.js中的onconnection的第一部分。下面我们来看这个函数的第二部分。
+```js
+// 文件地址：/lib/net.js
+function onconnection(err, clientHandle) {
+  ...
+  // 第一部分：创建一个Socket实例socket（省略，详见上一节2.3）
+  // 第二部分：触发业务回调（同时将刚刚创建的Socket实例作为参数传进去）
+  self.emit('connection', socket);
+}
+```
+这里触发了一个connection事件。在net.js中曾经注册过一个：
+```js
+// 文件位置：/lib/net.js
+function Server(options, connectionListener) {
+  ...
+  if (typeof options === 'function') {
+    connectionListener = options;
+    options = {};
+    this.on('connection', connectionListener);
+    ...
+}
+```
+可见，这里最终要执行的逻辑就是服务启动时，传入的业务回调代码：
 
-故事中的情节中，机器人给王大妈分配好篮子，并装好探测器后，王大妈可能有两种选择：
+```js
+// 业务代码：
+const net = require('net');
+const server = net.createServer((c) => {
+  console.log('new tcp connection arrived');
+  c.on('data', () => {
+      console.log('user data arrived');
+  })
+});
+```
+
+仔细分析一下这个connectionListener函数：
+```js
+(c) => {
+  // 第一部分：用户可以打印日志，也可以计数等
+  console.log('new tcp connection arrived');
+  // 第二部分：监听data事件，获取用户数据
+  c.on('data', () => {
+      console.log('user data arrived');
+  })
+}
+```
+这里是真正的业务开发写的代码，用户可以在这里干两件事情：
+* 打印日志，或者计算用户数
+* 监听data事件，获取用户传输的数据
+
+我们重点来看第二部分，监听data事件，看看它的作用。
+
+#### 2.4.2 监听data事件
+
+这里c.on('data')中的c，就是2.3节中封装的Socket实例（const socket = new Socket），它是一个Duplex stream, 继承了_stream_readable的on方法:
+```js
+//文件位置：/lib/_stream_readable.js
+Readable.prototype.on = function(ev, fn) {
+  const res = Stream.prototype.on.call(this, ev, fn);
+  ...
+  if (ev === 'data') {
+    ...
+      this.resume();
+  }...
+};
+```
+
+可以看到，除了调用Stream基类的on注册事件外，还额外调用了this.resume()。
+
+```js
+//文件位置：/lib/_stream_readable.js
+Readable.prototype.resume = function() {
+  const state = this._readableState;
+  if (!state.flowing) {
+    ...
+    state.flowing = !state.readableListening;
+    resume(this, state);
+  }...
+};
+```
+this.resume的主要作用就是将stream状态设置为流动状态(state.flowing = !state.readableListening）
+
+> 为什么要将stream的状态设置为true呢？这里先留个悬念，下一节揭晓。
+
+### 2.5 接收客户端传输的数据
+
+本章故事的情节中，机器人给王大妈分配好篮子，并装好探测器后，王大妈可能有两种选择：
 * 1.临时决定不采购东西，离开店铺
 * 2.把要购买的东西写下来，放进分配给自己的“蓝色篮子”里面。
 
-如果是第一种情况，那么机器人过一定时间后，会把1号“蓝色篮子”回收，对应于服务器会把tcp链接销毁。
+如果是第一种情况，那么机器人过一定时间后，会把1号“蓝色篮子”回收（对应于服务器会把tcp链接销毁）。
 
 本书主要分析第二种情况。
 
@@ -514,6 +555,9 @@ uv__io_start我们就比较清晰了，它就是把libuv客户端实例的观察
 
 nodejs服务主线程的无限循环依然在进行，此时的watcher_queue中，不止有服务实例的观察者，还有新创建的libuv客户端实例对应的观察者。
 
+>假设没有新用户到来，只有刚才那一个用户，那么libuv监测服务实例不会有任何收获。因此我们先把目光聚焦到客户端实例上，看看libuv监测客户端实例有什么收获。
+
+#### 2.5.1 libuv监测客户端实例是否有数据
 我们再把“2.1 uv__io_poll”节中的代码片段贴出来：
 ```c++
 // 文件地址：/deps/uv/src/unix/linux-core.c
@@ -579,7 +623,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
 * 如果是服务实例，会额外调用listen。listen过程中（uv_tcp_listen）会用uv__server_io覆盖w->cb。
 
 客户端通信时，由于w->cb没有被覆盖，所以此时的w->cb就是 uv__stream_io。
-### 2.8 uv__stream_io
+#### 2.5.2 数据到来，读取数据
 
 ```c++
 // 文件地址：/deps/uv/src/unix/stream.c
@@ -603,16 +647,20 @@ static void uv__read(uv_stream_t* stream) {
       }
   ...
 ```
-可见，uv__stream_io会调用stream->read_cb；
+可见，uv__stream_io会调用经典函数 uv__read;而uv__read会调用stream->read_cb；
 
-在2.6小节中，我们知道stream.read_cb其实是
+在2.3.2小节中，我们知道stream.read_cb 其实是uv_read_start的第三个参数函数：
 ```c++
-// 文件地址：/src/stream_wrap.cc 
-[](uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+// 文件地址：/src/stream_wrap.cc
+int LibuvStreamWrap::ReadStart() {
+  return uv_read_start(stream(), [](uv_handle_t* handle,
+                                    size_t suggested_size,
+                                    uv_buf_t* buf) {
     static_cast<LibuvStreamWrap*>(handle->data)->OnUvAlloc(suggested_size, buf);
   }, [](uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     static_cast<LibuvStreamWrap*>(stream->data)->OnUvRead(nread, buf);
-  }
+  });
+}
 
 void LibuvStreamWrap::OnUvRead(ssize_t nread, const uv_buf_t* buf) {
   ...
@@ -621,6 +669,7 @@ void LibuvStreamWrap::OnUvRead(ssize_t nread, const uv_buf_t* buf) {
 ```
 可以看出，我们调用stream->read_cb，其实是在调用OnUvRead，并触发EmitRead(nread, *buf);
 
+下面我们就来看看EmitRead：
 ```C++
 // 文件地址：/src/stream_base-inl.h
 void StreamResource::EmitRead(ssize_t nread, const uv_buf_t& buf) {
@@ -643,7 +692,16 @@ MaybeLocal<Value> StreamBase::CallJSOnreadMethod(ssize_t nread, Local<ArrayBuffe
   ...
   return wrap->MakeCallback(onread.As<Function>(), arraysize(argv), argv);
 }
+```
 
+可见，EmitRead调用了OnStreamRead，OnStreamRead调用了onread函数。
+
+这个onread函数是通过onread = wrap->object()->GetInternalField(StreamBase::kOnReadFunctionField);获得的，那么它到底是什么呢？
+
+我们来一一分析：
+* 首先stream_base.c中事先有作属性设置
+```C++
+// 文件地址：/src/stream_base.c
 void StreamBase::AddMethods(Environment* env, Local<FunctionTemplate> t) {
   ...
   t->PrototypeTemplate()->SetAccessor(
@@ -656,6 +714,7 @@ void StreamBase::AddMethods(Environment* env, Local<FunctionTemplate> t) {
 }
 ```
 
+* 然后net.js中将对属性onread赋值：
 ```js
 // 文件地址：/lib/net.js
 function initSocketHandle(self) {
@@ -664,7 +723,12 @@ function initSocketHandle(self) {
     ...
   }
 }
+```
 
+所以，这里onread = wrap->object()->GetInternalField(StreamBase::kOnReadFunctionField);获取到的就是onStreamRead。
+
+那么我们来看看这个onStreamRead干了啥：
+```js
 // 文件地址：/lib/internal/stream_base_commons.js
 function onStreamRead(arrayBuffer) {
   ...
@@ -688,41 +752,35 @@ function readableAddChunk(stream, chunk, encoding, addToFront) {
   ...
 }
 ...
-function addChunk(stream, state, chunk, addToFront) {
+function addChunk(..., chunk, ...) {
+  if (state.flowing && state.length === 0 && !state.sync) {
     ...
     stream.emit('data', chunk);
+  } else {
     ...
+  }
+  ...
+}
 ```
+这里最终调用了addChunk。检测到stream处于流动中，于是直接触发一个data事件。
 
-到此，触发了一个'data'事件。这个事件是在哪里注册呢？
+> 2.4.2小节中留有一个悬念：为什么要把流的状态(state.flowing)设置为流动状态（true）。这里就给出了答案。
+#### 2.5.3 消费数据
+上一节中，触发了一个'data'事件。这个事件是在哪里注册呢？
 
 答案就是用户自己写的业务代码：
 ```js
-// 1.引入net
 const net = require('net');
-// 2.创建一个服务
 const server = net.createServer((c) => {
   ...
   c.on('data', () => {
       console.log('data event');
-      c.write('HTTP/1.1 200 OK\r\n');
-        c.write('Connection: keep-alive\r\n');
-        c.write('Content-Length: 12\r\n');
-        c.write('\r\n');
-        c.write('hello world!');
   })
 });
-
-// 3.监听端口
-server.listen(9090, () => {
-  console.log('server bound');
-});
 ```
-> 注：这里的c，就是net.js中创建的Socket实例，该实例下面的_handle指向libuv客户端实例。
+剩下的就看业务如何消费数据啦。
 
-业务js逻辑开始接手。
-
-# 四.总结：
+# 四.总结
 服务启动后，libuv便开始执行一个无限循环，监听watcher_queue队列里的观察者。
 
 没有客户访问时，这个watcher_queue队列中只有一个服务实例的观察者。libuv通过监听这个观察者，判断是否有新tcp三次握手建立。
