@@ -4,7 +4,7 @@
 
 
 # 一.故事
-“10010百货店”要开张营业了，由于所在的市经贸大厦有规定，店铺外面不能张贴任何标识。
+“10010百货店”要开张营业了，但是所在的市经贸大厦有规定，店铺外面不能张贴任何标识。
 
 为了让客户找到该商店，店主必须制作一些宣传单，在开张前，把宣传单发放到人们手里。
 
@@ -99,11 +99,11 @@ server.listen(9090, () => {
 
 nodejs源码是由C++和js两部分语言文件组成。其中的模块被划分为两类模块：
 
-* 内建模块
+* 内建模块（built-in model）
   * 由c++编写的。核心的处理逻辑，都是c++语言开发的，这些模块官方称为build-in模块；
   * 代码放置在/src目录下。
   * 举例：node.cc, node_file.cc, node_buffer.cc等
-* 原生模块
+* 原生模块(native model)
   * 由于nodejs是给js开发者写的，因此又封装了一层js模块给js开发者使用，这部分模块官方称为native模块（相对于开发者自己写的模块）；
   * 代码放置在/lib目录下。
   * 举例：net.js, http.js, fs.js, util.js等
@@ -229,7 +229,9 @@ function createServerHandle(address, port, addressType, fd, flags) {
 }
 ...
 ```
-setupListenHandle会调用createServerHandle， 进而创建一个TCP实例，并返回。
+从上面代码可以看出，setupListenHandle做了两件事：
+* 调用createServerHandle， 进而创建一个TCP实例，然后绑定ip port(handle.bind(address, port)),并将该实例返回
+* 用刚刚返回的实例，调用其listen（注意这里的listen是封装的，详细逻辑后面会展开）
 
 #### 2.2.2 TCP实例创建过程分析
 
