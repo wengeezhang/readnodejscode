@@ -403,6 +403,9 @@ onconnection比较简单，做了两件事：
 * 创建一个Socket实例
 * 触发connection事件，传入刚刚创建的socket对象。
 
+触发connection后，将会直接执行业务回调，业务回调
+调用了on('data'),将stream启动。
+
 创建Socket实例的过程非常重要，也就是在这里，把新建的libuv客户端实例交给了libuv管理。
 
 我们来看下Socket这个构建函数：
