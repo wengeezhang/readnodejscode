@@ -111,13 +111,39 @@ function insert(item, msecs, start = getLibuvNow()) {
   L.append(list, item);
 }
 ```
-insert主要做了5件事：
+insert主要做了4件事：
 * 创建一个链表：list = new TimersList(expiry, msecs)
-* 将链表list存放到map中：timerListMap[msecs] = list
 * 将链表list存放到专用队列：timerListQueue.insert(list);
 * 给libuv传递一个信号，表示有一个“msecs”的timer实例：scheduleTimer(msecs);
 * 将timer实例插入到新建的链表list中。
+
+接下来我们来一一分解这四件事。
 #### 2.2.1 创建链表
+
+nodejs会用链表来存储创建的timer实例。但是有一点需要注意，nodejs不是只维护一个链表，而是根据timer的时间，维护不通的链表。
+举例来讲，setTimeout(fn1, 1000) 和setTimeout(fn2, 2000)两个timer实例，是在两个不通的链表中维护的。
+
+业务开发中，可能会创建很多不通时间的timer实例，nodejs对应的就会维护多个链表。所有的链表通过一个map对象维护起来，就是timerListMap。
+
+timerListMap的key就是延迟时间，值就是链表。
+
+```js
+// timerListMap结构：
+{
+  "1000": list1,
+  "2000": list2,
+  ...
+  "3001": listn
+}
+```
+
+所以insert函数第一步要做的事情，就是去timerListMap中查询是否已经有对应的链表存在；如果存在，那么取出这个存在的链表；如果不存在，则新建一个链表。
+
+新建链表是通过“list = new TimersList(expiry, msecs);”这个语句实现的。可以看出，新链表就是TimerList实例。
+
+
+
+
 
 ### 2.3 触发timer实例的回调
 
