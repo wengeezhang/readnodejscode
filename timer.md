@@ -31,7 +31,7 @@ setTimeout(() => {
 
 很简单，就是在3分钟后，执行一段逻辑。类似于故事场景中，微波炉设置3分钟。
 ## 2. 源码解读
-### 2.1 创建一个timer实例
+
 setTimeout是全局函数，我们来看看它的定义：
 
 ```js
@@ -49,6 +49,7 @@ function setTimeout(callback, after, arg1, arg2, arg3) {
 * 然后将timeout插入到链表中。
 
 先看第一部分。
+### 2.1 创建一个timer实例
 新创建的timer实例，其实是一个Timeout对象。我们来看下这个构建函数的代码：
 ```js
 // 文件位置： /lib/internal/timers.js
@@ -120,8 +121,9 @@ insert主要做了4件事：
 接下来我们来一一分解这四件事。
 #### 2.2.1 创建链表
 
-nodejs会用链表来存储创建的timer实例。但是有一点需要注意，nodejs不是只维护一个链表，而是根据timer的时间，维护不通的链表。
-举例来讲，setTimeout(fn1, 1000) 和setTimeout(fn2, 2000)两个timer实例，是在两个不通的链表中维护的。
+nodejs会用链表来存储创建的timer实例。但是有一点需要注意，nodejs不是只维护一个链表，而是根据timer的时间，维护多个链表。
+
+举例来讲，setTimeout(fn1, 1000) 和setTimeout(fn2, 2000)两个timer实例，是在两个链表中维护的。
 
 业务开发中，可能会创建很多不通时间的timer实例，nodejs对应的就会维护多个链表。所有的链表通过一个map对象维护起来，就是timerListMap。
 
@@ -141,8 +143,99 @@ timerListMap的key就是延迟时间，值就是链表。
 
 新建链表是通过“list = new TimersList(expiry, msecs);”这个语句实现的。可以看出，新链表就是TimerList实例。
 
+TimerList是个典型的双向链表，有以下特征：
+
+* 链表中的节点首尾相连
+* 链表中有个“特殊节点”，代表这个链表自身（其实它和其他节点没什么区别，就是多存储了一些链表的信息，如链表id,过期时间等）
+* 节点都有两个属性，一个是_idlePrev，指向它的上一个节点；一个是_idleNext，指向它的下一个节点。
+
+![双向链表图解](./img/linkedlist.png)
+
+链表创建完成后，额外地将链表存放到映射对象timerListMap中，方便后续读取整个链表。
+
+双向链表一般都会具备以下功能：
+* 追加一个新节点（在链表末尾）：append
+* 删除一个节点: remove
+* 获取链表的头部节点（一般是最先插入的）: peek
+
+读到这里，js开发者会理所当然地认为，这些功能，应该是实例list下的方法，需要用的时候，直接调用即可。
+
+比如追加一个节点，就是：list.append(node1)。
+
+然而现实并不是这样。nodejs另外有一个专属工具来辅助完成。
+
+这个专属工具就是L：
+```js
+// 文件位置：/lib/internal/timers.js
+const L = require('internal/linkedlist');
+```
+
+翻看L的源码，发现它没有任何业务含义，只是纯粹的工具函数，拥有四个方法，没有任何状态。
+* init,
+* peek,
+* remove,
+* append,
+* isEmpty
+
+通过这个工具函数，我们便可以操作新建的链表，比如：
+* 追加一个节点：L.append(list, node1)
+* 删除一个节点：L.remove(node2)
+* 获取链表头部节点：L.peek(list);
 
 
+#### 2.2.2 将链表list存放到专用队列
+
+链表是管理timer节点的。然而链表也会有多个，怎么管理链表呢？
+
+>因为可能会创建很多timer，并且每个的过期时间不同，所有nodejs会有很多的链表。
+>每个链表存放相同过期时间的timer。
+
+
+答案是：nodejs额外维护了一个专用队列（其实就是一个二叉堆），新创建完链表都会插入到这个队列中进行管理。
+
+libuv每次会检测这个专用队列，找到最先过期的链表。
+
+我们来回顾一下插入专用队列的代码：
+```js
+// 文件位置：/lib/internal/timers.js
+// list是刚刚创建的链表；timerListQueue就是专用队列
+timerListQueue.insert(list);
+```
+
+timerListQueue是就是我们要的专用队列，它其实是一个PriorityQueue实例。
+
+```js
+// 文件位置：/lib/internal/timers.js
+const timerListQueue = new PriorityQueue(compareTimersLists, setPosition);
+```
+
+PriorityQueue的实例，是一个典型的二叉堆（binary heap），也叫二元堆积，二叉堆积。只不过它接受一个个性化的排序函数（类似Array#sort），用来对堆里的节点进行排序。
+
+>二叉堆典型又常用的功能为：
+>* 插入一个新节点
+>* 然后进行排序
+
+timerListQueue这个二叉堆也是这样，只不过它是在一个函数中完成的。我们来看下：
+
+```js
+// 文件位置：/lib/internal/priority_queue.js
+insert(value) {
+    // 1. 插入新节点
+    const heap = this[kHeap];
+    const pos = ++this[kSize];
+    heap[pos] = value;
+
+    if (heap.length === pos)
+      heap.length *= 2;
+    // 2. 排序
+    this.percolateUp(pos);
+  }
+```
+> 排序percolateUp这里不再展开，比较简单，读者可自行查看源码
+
+#### 2.2.3 给libuv传递一个信号，表示有一个“msecs”的timer实例：scheduleTimer(msecs);
+
+创建完了链表，并且将链表管理起来（插入专用队列）后，就可以发送一个信号给libuv，告诉它，业务这里有新建了timer，以便libuv能适当处理。
 
 
 ### 2.3 触发timer实例的回调
