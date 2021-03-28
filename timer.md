@@ -151,6 +151,8 @@ TimerList是个典型的双向链表，有以下特征：
 
 ![双向链表图解](./img/linkedlist.png)
 
+> 还有一种解读视角，是将节点想象为表盘上的点:顺时针向下表示next;逆时针向上表示pre;其中12点或者0点，表示链表的根节点。
+
 链表创建完成后，额外地将链表存放到映射对象timerListMap中，方便后续读取整个链表。
 
 双向链表一般都会具备以下功能：
@@ -191,31 +193,89 @@ const L = require('internal/linkedlist');
 >每个链表存放相同过期时间的timer。
 
 
-答案是：nodejs额外维护了一个专用队列（其实就是一个二叉堆），新创建完链表都会插入到这个队列中进行管理。
+答案是：nodejs额外维护了一个专用队列，这个队列是一个“优先队列”，新创建完链表都会插入到这个优先队列中进行管理。
 
-libuv每次会检测这个专用队列，找到最先过期的链表。
+然后nodejs会检测这个优先队列，找到最先过期的链表。如何快速找到最先过期的链表，是这个优先队列要解决的问题。
 
-我们来回顾一下插入专用队列的代码：
+实现方式有很多，不过最常见的便是用最小二叉堆来实现这个优先队列。
+
+##### 2.2.2.1 最小二叉堆表示优先队列
+
+我们先看下二叉堆。
+
+二叉堆本质是一棵二叉树，且最常见的是一棵完全二叉树。只不过它有一个额外的要求：父节点必须大于/小于子节点。
+
+如果是父节点大于子节点，那么这个二叉堆便是最大二叉堆；
+如果是父节点小于子节点，那么这个二叉堆便是最小二叉堆；
+
+由于nodejs这里的“优先队列”维护的是过期时间这个概念，最先过期的要优先找到，因此最小二叉堆便是我们选择的方案。
+
+> 优先队列，我们采用最小二叉堆这个方案。
+
+选定了方案，再来看实现最小二叉堆具体的实现方式。
+
+实现二叉堆有两种方式，一种是链表，一种是数组。由于数组的简洁性，因此大多数二叉堆都是采用数组来实现。
+
+##### 2.2.2.2 采用数组实现最小二叉堆
+先看算法设计：
+
+二叉堆和数组之间存在一个奇妙的对应关系：
+* 将二叉堆中的节点，按照“从上到下”，“从左到右”地，一一放到数组中去（一般数组中第一个元素空置，从下标1位置开始放）
+* 数组中任何一个元素（假设index为n）,它的子元素是2n、2n+1;它的父元素是"n/2 | 0"(即Math.floor(n/2))。
+
+再看实现：
+
+由于我们是用数组来实现最小二叉堆，因此最开始我们初始化一个空数组arr。
+* 最开始二叉堆是空的，新增一个节点，则往数组arr中push一个元素（从下标1开始）
+* 当继续新增节点时，还是往数组中push元素，然后执行percolateup算法，进行排序。
+
+我们来看下percolateup代码，非常简单：
+```c++
+// 文件位置：/lib/internal/priority_queue.js
+percolateUp(pos) {
+    const heap = this[kHeap];
+    const compare = this[kCompare];
+    const setPosition = this[kSetPosition];
+    const item = heap[pos];
+
+    while (pos > 1) {
+      // 找到父元素
+      const parent = heap[pos / 2 | 0];
+      // 如果比父元素小，则不用再排了，直接结束
+      if (compare(parent, item) <= 0)
+        break;
+      // 如果比父元素大，现将父元素转移下来
+      heap[pos] = parent;
+      if (setPosition !== undefined)
+        setPosition(parent, pos);
+      // 接着讲pos换成父元素的位置，继续比较
+      pos = pos / 2 | 0;
+    }
+    // 比较完成后，确定新节点的位置后，便把它插入。
+    heap[pos] = item;
+    if (setPosition !== undefined)
+      setPosition(item, pos);
+  }
+```
+##### 2.2.2.3 将timer链表插入优先队列
+
+我们来看一下nodejs中插入专用队列的代码：
 ```js
 // 文件位置：/lib/internal/timers.js
 // list是刚刚创建的链表；timerListQueue就是专用队列
 timerListQueue.insert(list);
 ```
 
-timerListQueue是就是我们要的专用队列，它其实是一个PriorityQueue实例。
+timerListQueue是就是我们要的优先队列，它其实是一个PriorityQueue实例。
 
 ```js
 // 文件位置：/lib/internal/timers.js
 const timerListQueue = new PriorityQueue(compareTimersLists, setPosition);
 ```
 
-PriorityQueue的实例，是一个典型的二叉堆（binary heap），也叫二元堆积，二叉堆积。只不过它接受一个个性化的排序函数（类似Array#sort），用来对堆里的节点进行排序。
+PriorityQueue的实例，即典型的二叉堆（binary heap）。
 
->二叉堆典型又常用的功能为：
->* 插入一个新节点
->* 然后进行排序
-
-timerListQueue这个二叉堆也是这样，只不过它是在一个函数中完成的。我们来看下：
+timerListQueue这个二叉堆的插入和排序如下：
 
 ```js
 // 文件位置：/lib/internal/priority_queue.js
@@ -231,13 +291,270 @@ insert(value) {
     this.percolateUp(pos);
   }
 ```
-> 排序percolateUp这里不再展开，比较简单，读者可自行查看源码
+> this.percolateUp参见上一小节的代码
 
 #### 2.2.3 给libuv传递一个信号，表示有一个“msecs”的timer实例：scheduleTimer(msecs);
 
-创建完了链表，并且将链表管理起来（插入专用队列）后，就可以发送一个信号给libuv，告诉它，业务这里有新建了timer，以便libuv能适当处理。
+创建完了链表，并且将链表管理起来（插入优先队列）后，就可以发送一个信号给libuv，告诉它，业务这里有新建了timer，以便libuv能适当处理。
 
+怎么告诉libuv呢？
+我们来看代码
+```js
+// 文件位置：/lib/internal/timers.js
+function insert(item, msecs, start = getLibuvNow()) {
+  ...
+  let list = timerListMap[msecs];
+  if (list === undefined) {
+    ...
+    // 插入优先队列
+    timerListQueue.insert(list);
+    ...
+    const expiry = start + msecs;
+    ...
+    // 如果新增的链表过期时间比上一次最小的过期时间还早，那么就通知livuv
+    if (nextExpiry > expiry) {
+      scheduleTimer(msecs);
+      nextExpiry = expiry;
+    }
+  }
+  ...
+}
+```
+从代码中可以看出，如果新的链表的过期时间比最短的过期时间还早（比如上一次是12点5分, 而此次的过期时间是12点1分），那么就有必要告诉libuv，说最近的过期时间要调整一下啦。
+
+我们来看下scheduleTimer函数：
+```c++
+// 文件位置：/src/timers.cc
+void ScheduleTimer(const FunctionCallbackInfo<Value>& args) {
+  auto env = Environment::GetCurrent(args);
+  env->ScheduleTimer(args[0]->IntegerValue(env->context()).FromJust());
+}
+
+// 文件位置：/src/env.cc
+void Environment::ScheduleTimer(int64_t duration_ms) {
+  if (started_cleanup_) return;
+  uv_timer_start(timer_handle(), RunTimers, duration_ms, 0);
+}
+```
+可以看出，ScheduleTimer最终调用了libuv中的uv_timer_start。
+
+uv_timer_start就比较纯粹了，它无法做了两件事：
+* 设置到期时要执行的回调函数
+  * handle->timer_cb = cb;
+  * 这里的cb就是uv_timer_start(timer_handle(), RunTimers, duration_ms, 0)中的RunTimers。
+* 往最小堆中插入新的节点
+  * heap_insert(timer_heap(handle->loop),
+              (struct heap_node*) &handle->heap_node,
+              timer_less_than);
+  * 注意这里的最小堆是libuv维持的，和nodejs中的优先队列最小堆不一样
+
+```c++
+// 文件位置：/deps/uv/src/timers.c
+int uv_timer_start(uv_timer_t* handle,
+                   uv_timer_cb cb,
+                   uint64_t timeout,
+                   uint64_t repeat) {
+  uint64_t clamped_timeout;
+
+  if (uv__is_closing(handle) || cb == NULL)
+    return UV_EINVAL;
+
+  if (uv__is_active(handle))
+    uv_timer_stop(handle);
+
+  clamped_timeout = handle->loop->time + timeout;
+  if (clamped_timeout < timeout)
+    clamped_timeout = (uint64_t) -1;
+
+  handle->timer_cb = cb;
+  handle->timeout = clamped_timeout;
+  handle->repeat = repeat;
+  /* start_id is the second index to be compared in timer_less_than() */
+  handle->start_id = handle->loop->timer_counter++;
+
+  heap_insert(timer_heap(handle->loop),
+              (struct heap_node*) &handle->heap_node,
+              timer_less_than);
+  uv__handle_start(handle);
+
+  return 0;
+}
+```
+
+到此位置，创建一个新的timer对象的准备工作就算全部完成了。接下来就交给libuv去决定什么时候触发回调了。
 
 ### 2.3 触发timer实例的回调
 
+libuv是在uv__run_timers这个阶段来处理timer的。我们来看下它的代码：
+
+```c++
+// 文件位置：/deps/uv/src/timers.c
+void uv__run_timers(uv_loop_t* loop) {
+  struct heap_node* heap_node;
+  uv_timer_t* handle;
+
+  for (;;) {
+    heap_node = heap_min(timer_heap(loop));
+    if (heap_node == NULL)
+      break;
+
+    handle = container_of(heap_node, uv_timer_t, heap_node);
+    if (handle->timeout > loop->time)
+      break;
+
+    uv_timer_stop(handle);
+    uv_timer_again(handle);
+    handle->timer_cb(handle);
+  }
+}
+```
+
+可以看到这里的逻辑很清晰，做了以下几件事：
+* 从最小堆中取出最早过期的节点：
+  * heap_node = heap_min(timer_heap(loop));
+* 将该节点从最小堆中删除（如果是setInterval，再重新插入进去）
+  * uv_timer_stop(handle);
+  * uv_timer_again(handle);
+* 执行节点上绑定的回调
+  * handle->timer_cb(handle);
+  * 这里的timer_cb就是2.2小节中的RunTimers
+
+到这里，接力棒给到了RunTimers，我们来看下它的代码：
+
+```c++
+// 文件位置：/src/env.cc
+void Environment::RunTimers(uv_timer_t* handle) {
+  Environment* env = Environment::from_timer_handle(handle);
+  TraceEventScope trace_scope(TRACING_CATEGORY_NODE1(environment),
+                              "RunTimers", env);
+
+  ...
+  Local<Function> cb = env->timers_callback_function();
+  ...
+  do {
+    ...
+    ret = cb->Call(env->context(), process, 1, &arg);
+  } while (ret.IsEmpty() && env->can_call_into_js());
+  ...
+  if (ret.IsEmpty())
+    return;
+  ...
+
+  if (expiry_ms != 0) {
+    env->ScheduleTimer(...);
+    ...
+  } else {
+    uv_unref(h);
+  }
+}
+
+```
+RunTimers的主要功能：
+* 执行env->timers_callback_function()
+* 判断是否有剩余的链表，如果有，再次编排上env->ScheduleTimer
+
+我们主要看下env->timers_callback_function。它是什么呢？
+
+回想一下，在nodejs进程启动的时候，执行过node.js这个模块，在它里面执行过以下代码：
+```js
+// 文件位置：/lib/internal/bootstrap/node.js
+{
+  const { nextTick, runNextTicks } = setupTaskQueue();
+  ...
+  const { getTimerCallbacks } = require('internal/timers');
+  const { setupTimers } = internalBinding('timers');
+  const { processImmediate, processTimers } = getTimerCallbacks(runNextTicks);
+  ...
+  setupTimers(processImmediate, processTimers);
+}
+```
+
+```c++
+// 文件位置：/src/timers.cc
+void SetupTimers(const FunctionCallbackInfo<Value>& args) {
+  ...
+  env->set_immediate_callback_function(args[0].As<Function>());
+  env->set_timers_callback_function(args[1].As<Function>());
+}
+```
+从上面代码中看到，processTimers是/lib/internal/timers.js中导出的一个函数；
+
+而setupTimers，就是将processTimers设置为了timers_call_function。
+
+也就是说，RunTimers中执行的函数，就是 processTimers。
+
+那么我们来看看processTimers：
+```js
+// 文件位置：/lib/internal/timers.js
+  function processTimers(now) {
+    debug('process timer lists %d', now);
+    nextExpiry = Infinity;
+
+    let list;
+    let ranAtLeastOneList = false;
+    while (list = timerListQueue.peek()) {
+      if (list.expiry > now) {
+        nextExpiry = list.expiry;
+        return refCount > 0 ? nextExpiry : -nextExpiry;
+      }
+      if (ranAtLeastOneList)
+        runNextTicks();
+      else
+        ranAtLeastOneList = true;
+      listOnTimeout(list, now);
+    }
+    return 0;
+  }
+```
+processTimers非常简单，就是从之前讲过的优先队列中取出一个timer链表，判断是否过期：
+* 如果没有过期，则直接返回这个将来的过期时间（供后面判断）
+* 如果过期，则清理链表中的timers， 即调用listOnTimeout(list, now);
+  * 注意这里会适时地清理tick queue上的人物（runNextTicks()）
+
+那么最后，我们来看看，如果过期了，nodejs是如何清理timer链表的，即listOnTimeout：
+
+```js
+// 文件位置：/lib/internal/timers.js
+function listOnTimeout(list, now) {
+    const msecs = list.msecs;
+
+    debug('timeout callback %d', msecs);
+
+    let ranAtLeastOneTimer = false;
+    let timer;
+    // 取出最先插入的timer
+    while (timer = L.peek(list)) {
+      ...
+      L.remove(timer);
+      ...
+
+      try {
+        const args = timer._timerArgs;
+        if (args === undefined)
+          timer._onTimeout();
+        else
+          timer._onTimeout(...args);
+      } finally {
+        ...
+      }
+      ...
+    }
+    ...
+  }
+```
+
+这里隐藏其他逻辑，只看核心逻辑，可以看出listOnTimeout的功能：
+* 从链表中取出最先插入的timer：timer = L.peek(list)
+* 执行这个timer的回调：timer._onTimeout();
+
+到此为止，nodejs触发timer回调的流程便结束了。
+
 # 四.总结：
+
+timer的生命周期可以简单划分为以下三个阶段：
+
+* 创建timer实例对象
+* 塞入链表
+* 在合适的时机清理链表
+
+而这一切，是通过js世界中的【链表+最小堆】、c++世界中的【最小堆】配合起来，由libuv主导循环运作来实现的。
