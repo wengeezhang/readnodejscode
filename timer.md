@@ -338,7 +338,7 @@ void Environment::ScheduleTimer(int64_t duration_ms) {
 ```
 可以看出，ScheduleTimer最终调用了libuv中的uv_timer_start。
 
-uv_timer_start就比较纯粹了，它无法做了两件事：
+uv_timer_start就比较纯粹了，它无法做了三件事：
 * 设置到期时要执行的回调函数
   * handle->timer_cb = cb;
   * 这里的cb就是uv_timer_start(timer_handle(), RunTimers, duration_ms, 0)中的RunTimers。
@@ -347,6 +347,8 @@ uv_timer_start就比较纯粹了，它无法做了两件事：
               (struct heap_node*) &handle->heap_node,
               timer_less_than);
   * 注意这里的最小堆是libuv维持的，和nodejs中的优先队列最小堆不一样
+* 将handle设置为激活状态：
+  * uv__handle_start(handle);
 
 ```c++
 // 文件位置：/deps/uv/src/timers.c
@@ -381,7 +383,104 @@ int uv_timer_start(uv_timer_t* handle,
 }
 ```
 
-到此位置，创建一个新的timer对象的准备工作就算全部完成了。接下来就交给libuv去决定什么时候触发回调了。
+
+> 新建timer对象的流程小结：
+> * 创建一个timer对象
+> * 插入链表 (如果对应的链表不存在则新建链表)
+> * 如果新建了链表，则将新链表放到优先队列中
+> * 如果新建的timer对象比以前的更快过期，则调用scheduleTimer, 告知libuv。
+
+且慢，细心的网友可能会发现一个小小的疑问：每次有新的更短的timer，都要调用scheduleTimer，scheduleTimer 再调用uv_timer_start往libuv最小堆里插入一个timer handle的节点（handle->heap_node，此处的handle为timer handle），而且是同一个节点。这肯定不对。
+
+这和已知的“新版本的nodejs中，libuv最小堆里面只有一个timer handle的节点”冲突了。
+
+> 新版本的nodejs中，libuv的最小堆中仅仅维护一个节点，即最快到期的节点。
+>/lib/internal/timers.js中通过优先队列和链表，管理所有的各个过期时间的timer对象。
+
+libuv中，一个timer handle对应有一个heap_node。由于我们每次调用scheduleTimer，都是取的同一个timer handle
+> 说明：
+>nodejs中只维护一个timer handle，每次调用，直接返回&timer_handle_。
+>```js
+> // 文件位置：/src/env.cc
+>void Environment::ScheduleTimer(int64_t duration_ms) {
+>  ...
+>  uv_timer_start(timer_handle(), RunTimers, duration_ms, 0);
+>}
+> // 文件位置：/src/env-inl.h
+>(inline uv_timer_t* Environment::timer_handle() {
+>  return &timer_handle_;
+>})
+
+所以，在调用uv_timer_start时，应该会做一个检查。
+
+仔细查看，我们发现uv_timer_start会检测uv__is_active(handle)，如果是已经激活的状态，那么会首先停止它。
+```c++
+// 文件位置：/deps/uv/src/timers.c
+int uv_timer_start(uv_timer_t* handle,
+                   uv_timer_cb cb,
+                   uint64_t timeout,
+                   uint64_t repeat) {
+  uint64_t clamped_timeout;
+
+  if (uv__is_closing(handle) || cb == NULL)
+    return UV_EINVAL;
+
+  if (uv__is_active(handle))
+    uv_timer_stop(handle);
+```
+uv__is_active比较简单，直接判断handle的flag状态：
+```c++
+// 文件位置：/deps/uv/src/uv-common.h
+#define uv__is_active(h)                                                      \
+  (((h)->flags & UV_HANDLE_ACTIVE) != 0)
+
+```
+> 每个handle都会有flags，可能的取值为：
+> UV_HANDLE_CLOSING                     = 0x00000001,
+  UV_HANDLE_CLOSED                      = 0x00000002,
+  UV_HANDLE_ACTIVE                      = 0x00000004,
+  ...
+>
+>假如同时设置了两个timer:
+>```js
+>setTimeout(() => {}, 5000)
+>setTimeout(() => {}, 1000)
+>```
+>
+>第一个5秒的timer会将全局唯一的timer handle激活，但是此时由于还没到过期时间，立马来了一个新的更快到期的timer(1秒)，此时调用uv__is_active会返回true
+
+此时uv__is_active返回true,因此libuv会调用uv_timer_stop(handle),来停止timer handle。其实停止timer handle主要是完成两件事：
+* 将timer handle变为非激活状态；同时将程序loop的active handles减1
+* 从libuv最小堆中将timer handle对于的节点删除
+
+```c++
+// 文件位置：/deps/uv/src/timer.c
+int uv_timer_stop(uv_timer_t* handle) {
+  if (!uv__is_active(handle))
+    return 0;
+
+  heap_remove(timer_heap(handle->loop),
+              (struct heap_node*) &handle->heap_node,
+              timer_less_than);
+  uv__handle_stop(handle);
+
+  return 0;
+}
+// 文件位置：/deps/uv/src/uv-common.h
+#define uv__handle_stop(h)                                                    \
+  do {                                                                        \
+    if (((h)->flags & UV_HANDLE_ACTIVE) == 0) break;                          \
+    (h)->flags &= ~UV_HANDLE_ACTIVE;                                          \
+    if (((h)->flags & UV_HANDLE_REF) != 0) uv__active_handle_rm(h);           \
+  }                                                                           \
+  while (0)
+```
+
+删除完后，就可以重新再插入了。
+
+
+
+到此为止，创建一个新的timer对象的准备工作就算全部完成了。接下来就交给libuv去决定什么时候触发回调了。
 
 ### 2.3 触发timer实例的回调
 
@@ -507,8 +606,17 @@ void SetupTimers(const FunctionCallbackInfo<Value>& args) {
   }
 ```
 processTimers非常简单，就是从之前讲过的优先队列中取出一个timer链表，判断是否过期：
-* 如果没有过期，则直接返回这个将来的过期时间（供后面判断）
-* 如果过期，则清理链表中的timers， 即调用listOnTimeout(list, now);
+* 如果没有过期(返回值为非0)，则直接返回这个将来的过期时间（供后面判断）
+> processTimers是在RunTimers中被调用的，RunTimers执行完processTimers后，会判断其返回值，参见/src/env.cc中的注释：
+> // To allow for less JS-C++ boundary crossing, the value returned from JS
+  // serves a few purposes:
+  // 1. If it's 0, no more timers exist and the handle should be unrefed
+  // 2. If it's > 0, the value represents the next timer's expiry and there
+  //    is at least one timer remaining that is refed.
+  // 3. If it's < 0, the absolute value represents the next timer's expiry
+  //    and there are no timers that are refed.
+
+* 如果过期（返回值为0），则清理链表中的timers， 即调用listOnTimeout(list, now);
   * 注意这里会适时地清理tick queue上的人物（runNextTicks()）
 
 那么最后，我们来看看，如果过期了，nodejs是如何清理timer链表的，即listOnTimeout：
