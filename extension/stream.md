@@ -36,4 +36,25 @@ async transparentReq(ctx, opts){
 ```
 
 解读：
-* 
+* 首先koajs底层的封装有待提升，使得业务开发直接使用时，有很多困惑。
+    * koajs的源文件中（lib/application.js）respond方法大致如下：“const res = ctx.res;let body = ctx.body;... if (body instanceof Stream) return body.pipe(res);”
+    * 可以看出，这里将ctx.body给到ctx.res(nodejs的原生response对象)
+
+* 如果不设置await，而是在http.request的回调中设置“ctx.body = res”,即如下方式：
+```js
+async transparentReq(ctx, opts){
+    const req = http.request(opts && opts.transUrl || ctx.request.url, {
+        method: ctx.method,
+        headers: {
+            'Content-Type': ctx.headers['content-type'],
+        }
+    }, (res) => {
+        // 直接将res给到ctx.body
+        ctx.body = res; 
+    })
+    ctx.set('content-type', 'application/json;utf8');
+    ctx.req.pipe(req);
+    },
+```
+
+这样的后果是transparentReq将立马返回，koajs会继续执行中间件，中间件执行完毕，会立即执行lib/application.js中的respond。此时ctx.body还没有被赋值，就会造成意向不到的结果。
