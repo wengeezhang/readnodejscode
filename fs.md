@@ -97,3 +97,7 @@ function maybeReadMore_(stream, state) {
 > addChunk最后会调用一个 maybeReadMore 再次读取。（这里解决flow中无限循环read只执行一次，以实现源源不断地读取数据，进行流）
 > maybeReadMore 通过read(0)来再次调用_read方法，来继续读取数据。
 # 四.总结：
+
+
+
+
