@@ -112,7 +112,7 @@ function flow(stream) {
 2. 将可读流pipe给另外一个可写流，对应于：pipe(dest)
 3. 自己控制，想消费时再消费，即暂停模式，对应的操作有：on('readable') stream.read()
   在这种模式下，一般都是想读一部分后，做对应的处理。此时如果要想持续读取全部，需要手工设置一个while循环。
-  大多数场景下，虽然是暂停模式，其实是读取一部分后，做对应的处理，而不是只读一部分。
+  大多数场景下，虽然是暂停模式，其实是读取一部分后，做对应的处理，接着读取其他部分。而不是只读一部分。
   ```js
   // Therefore to read a file's whole contents from a readable, it is necessary to collect chunks across multiple 'readable' events:
   const chunks = [];
@@ -143,6 +143,13 @@ Readable.prototype.pipe = function(dest){
   ...
 }
 ```
+
+问题：
+1. 如果同时监听了stream.on('data',cb), stream.pipe(dest)会发生什么呢？
+答：因为pipe的本质也是on('data'), 所以如果同时设置了这两个动作，其实也就是意味着有两个消费者。stream基于event，当事件满足需要触发回调时，是把instance._events里面所有的listener都触发一遍。所以数据会同时给到两个消费者。
+
+这跟一个stream,同时pipe多个可写流的效果是一样的，多个可写流对象都会收到数据。
+
 
 ```js
 Readable.prototype.read = function(n) {
@@ -232,12 +239,16 @@ Readable.prototype.read = function(n) {
   } else if (doRead) {
     debug('do read');
     // 这里先设置为reading状态。如果_read是同步的，那么读取完成，它会把reading设置为false。
-    // 如果是异步的，那么117行中的state.reading则依然是true，即还在读取中。
+    // 如果是异步的，那么下面第二个if中的state.reading则依然是true，即还在读取中。
+    // 为什么是这样呢？
+    // 因为无论是同步，还是异步，读取完成后，都要把读取的数据放到基类的state.buffer中，即调用push(chunk)方法。
+    // 我们看下push方法就知道了，它其中一个步骤就是把state.reading = false;
     state.reading = true;
     state.sync = true;
     // If the length is currently zero, then we *need* a readable event.
     if (state.length === 0)
       // needReadable的含义：need trigger readable event
+      // 即：是否用户监听了readable事件，并且需要触发
       state.needReadable = true;
     // Call internal read method
     this._read(state.highWaterMark);
@@ -281,6 +292,50 @@ Readable.prototype.read = function(n) {
     this.emit('data', ret);
 
   return ret;
+};
+```
+
+拿文件读取流来举例，fs.createReadStream，它的代码为：
+```js
+function createReadStream(path, options) {
+  lazyLoadStreams();
+  return new ReadStream(path, options);
+}
+
+// ReadStream为lib/internal/fs/stream下的一个class。
+
+function ReadStream(path, options) {
+  ...
+  // 指定kFs为fs，即lib/fs模块。require('fs')
+  this[kFs] = options.fs || fs;
+
+  ...
+
+  Readable.call(this, options);
+
+}
+
+// 重点来了，我们看下它的实现。
+// 注意：创建一个流，可以通过继承的方式，也可以直接使用_stream_reaable。如果是前者，则直接设定_read方法。
+// 如果是后者，则需要在初始化 _stream_readable 的实例是，设定opts中的read方法（_stream_readable构造函数内部会把read赋给_read）
+ReadStream.prototype._read = function(n) {
+  ...
+  // the actual read.
+  this[kIsPerformingIO] = true;
+  // 这里的this[kFs]就是lib/fs模块，它的read方法。
+  // 这里看最后一个参数，是一个回调函数，
+  this[kFs].read(
+    this.fd, pool, pool.used, toRead, this.pos, (er, bytesRead) => {
+      
+      if (er) {
+        ...
+      } else {
+        ...
+        // 可以看出，个性化的_read的最后一步就是push。
+        this.push(b);
+      }
+    });
+  ...
 };
 ```
 

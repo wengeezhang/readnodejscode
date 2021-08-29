@@ -8,6 +8,48 @@
 # 二.分析和对照
 
 # 三. nodejs源码解读
+
+fs模块提供的方法较多，但是核心的就是readFile和readFileSync。搞懂了这两个的运行原理和流程，其他的自然就知道了。
+
+我们看下readFile（异步）的实现。
+
+* 第一步：先初始化一个context，后续很多回调都会挂在这里。
+* 第二步：初始化一个req:const req = new FSReqCallback();把回调callback挂在这里。
+* 然后把context挂在到req上。req.context = context;req.oncomplete = readFileAfterOpen;
+* 调用binding.open方法（binding就是c++的fs模块）
+* open后，触发readFileAfterOpen， readFileAfterStat，最后来到binding.read方法。
+* binding.read就是c++模块的Read方法，它通过判断是否是异步，最后调用AsyncCall AsyncCall(env, req_wrap_async, args, "read", UTF8, AfterInteger,uv_fs_read, fd, &uvbuf, 1, pos);
+
+* AsyncCall的第七个参数uv_fs_read将会被调用，这个函数为：
+```c++
+int uv_fs_stat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
+  INIT(STAT);
+  PATH;
+  POST;
+}
+```
+
+POST为宏，它很简单，调用了 uv__work_submit
+
+```c++
+#define POST                                                                  \
+  do {                                                                        \
+    if (cb != NULL) {                                                         \
+      uv__req_register(loop, req);                                            \
+      uv__work_submit(loop,                                                   \
+                      &req->work_req,                                         \
+                      UV__WORK_FAST_IO,                                       \
+                      uv__fs_work,                                            \
+                      uv__fs_done);                                           \
+      return 0;                                                               \
+    }                                                                         \
+    else {                                                                    \
+      uv__fs_work(&req->work_req);                                            \
+      return req->result;                                                     \
+    }                                                                         \
+  }                                                                           \
+  while (0)
+```
 ```js
 // 文件位置：/lib/fs.js
 function lazyLoadStreams() {
