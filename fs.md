@@ -340,8 +340,159 @@ static ssize_t uv__fs_read(uv_fs_t* req) {
 }
 ```
 
+上面讲解了同步，我们看异步。POST调用了uv__work_submit：
+
+```c++
+void uv__work_submit(uv_loop_t* loop,
+                     struct uv__work* w,
+                     enum uv__work_kind kind,
+                     void (*work)(struct uv__work* w),
+                     void (*done)(struct uv__work* w, int status)) {
+  // 这里uv_once进行懒惰初始化，只初始化一次（创建线程池）
+  uv_once(&once, init_once);
+  w->loop = loop;
+  w->work = work;
+  w->done = done;
+  post(&w->wq, kind);
+}
+```
+这个方法需要注意的三个点：
+
+* 初始化线程池
+* 准备工作
+* 调用post，往相关的队列中插入任务
+
+其中看第一个点，初始化线程池：
+```c++
+// 文件位置：/deps/uv/src/unix/thread.c
+void uv_once(uv_once_t* guard, void (*callback)(void)) {
+  if (pthread_once(guard, callback))
+    abort();
+}
+
+// 这里的callback就是init_once
+
+// 文件位置：/deps/uv/src/threadpool.c
+static void init_once(void) {
+#ifndef _WIN32
+  /* Re-initialize the threadpool after fork.
+   * Note that this discards the global mutex and condition as well
+   * as the work queue.
+   */
+  if (pthread_atfork(NULL, NULL, &reset_once))
+    abort();
+#endif
+  init_threads();
+}
 
 
+static void init_threads(void) {
+  unsigned int i;
+  const char* val;
+  uv_sem_t sem;
+
+  nthreads = ARRAY_SIZE(default_threads);
+  ...
+  for (i = 0; i < nthreads; i++)
+    if (uv_thread_create(threads + i, worker, &sem))
+      abort();
+  ...
+}
+
+// 这里调用uv_thread_create创建一个线程。其中第二个参数worker就是要执行的任务。我们看下它的代码：
+
+static void worker(void* arg) {
+  ...
+  // 可以看到，这里就是在执行一个无限循环
+  for (;;) {
+    // 等待任务
+    while (QUEUE_EMPTY(&wq) ||
+           (QUEUE_HEAD(&wq) == &run_slow_work_message &&
+            QUEUE_NEXT(&run_slow_work_message) == &wq &&
+            slow_io_work_running >= slow_work_thread_threshold())) {
+      idle_threads += 1;
+      uv_cond_wait(&cond, &mutex);
+      idle_threads -= 1;
+    }
+
+    // 任务来到后，取出
+    q = QUEUE_HEAD(&wq);
+    if (q == &exit_message) {
+      uv_cond_signal(&cond);
+      uv_mutex_unlock(&mutex);
+      break;
+    }
+
+    QUEUE_REMOVE(q);
+    QUEUE_INIT(q);  /* Signal uv_cancel() that the work req is executing. */
+    ...
+    // 执行任务
+    w = QUEUE_DATA(q, struct uv__work, wq);
+    w->work(w);
+
+    uv_mutex_lock(&w->loop->wq_mutex);
+    w->work = NULL;  /* Signal uv_cancel() that the work req is done
+                        executing. */
+    QUEUE_INSERT_TAIL(&w->loop->wq, &w->wq);
+    // 通知主线程
+    uv_async_send(&w->loop->wq_async);
+    ...
+  }
+}
+
+// 这里的工作比较简单，就是循环等待，当有任务时，执行，然后通过uv_async_send通知主线程
+
+// 文件位置： /deps/uv/src/unix/async.c
+int uv_async_send(uv_async_t* handle) {
+  ...
+  /* Wake up the other thread's event loop. */
+  uv__async_send(handle->loop);
+  ...
+  return 0;
+}
+
+// 下面这个方法也很简单，通过往对应的fd上写一个长度为1的空内容，触发epoll捕获
+static void uv__async_send(uv_loop_t* loop) {
+  ...
+  buf = "";
+  len = 1;
+  fd = loop->async_wfd;
+  ...
+  do
+    r = write(fd, buf, len);
+  while (r == -1 && errno == EINTR);
+  ...
+  abort();
+}
+```
+
+第三个点，往队列中插入任务。然后线程池中的线程就会不断循环读取，只要有，便执行
+```c++
+// 文件位置：/deps/uv/src/threadpool.c
+// QUEUE_INSERT_TAIL
+static void post(QUEUE* q, enum uv__work_kind kind) {
+  uv_mutex_lock(&mutex);
+  if (kind == UV__WORK_SLOW_IO) {
+    /* Insert into a separate queue. */
+    QUEUE_INSERT_TAIL(&slow_io_pending_wq, q);
+    if (!QUEUE_EMPTY(&run_slow_work_message)) {
+      /* Running slow I/O tasks is already scheduled => Nothing to do here.
+         The worker that runs said other task will schedule this one as well. */
+      uv_mutex_unlock(&mutex);
+      return;
+    }
+    q = &run_slow_work_message;
+  }
+
+  QUEUE_INSERT_TAIL(&wq, q);
+  if (idle_threads > 0)
+    uv_cond_signal(&cond);
+  uv_mutex_unlock(&mutex);
+}
+```
+
+总结下两个路线图：
+![路线图](./img/fsTwoPath.png)
 
 1.readFile会调用read,read:
 ```js
