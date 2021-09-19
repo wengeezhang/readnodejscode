@@ -134,21 +134,28 @@ module.exports = fs = {
   ...
 }
 ```
+fs.readFileSync 对应故事章节中的“方式1”；fs.readFile 对应故事章节中的“方式2”。
 
-我们先看同步方式fs.readFileSync，对应故事章节中的“方式1”。
+我们先给出一个流程图，从全局视角看下两种方式的区别和联系：
+>用户读不懂没关系，我们接下来会一一解读。
 
-## 1.同步调用：
+![fs整体流程图](./img/fsTwoPath.png)
+
+> 由于两个方法关联性很强，所以我们采取并行解读的方式
+
+## 1.入口：
+
+![入口](./img/fsTwoPath.png)
+### 1.1 同步调用
 ```js
 // 文件位置：/lib/fs.js
-// line 361
+// 同步
 function readFileSync(path, options) {
   // 准备相关的参数
   ...
-  let pos = 0;
   let buffer;
   ...
-  // 这里只看其中一种情形，其他的代码忽略；todo:需要解读更多的类型
-  let bytesRead;
+  // 这里只看其中一种情形，其他的代码忽略；todo:需要解读更多的类型\
     ...
     tryReadSync(fd, isUserFd, buffer, pos, size - pos);
     ...
@@ -176,11 +183,6 @@ function tryReadSync(fd, isUserFd, buffer, pos, len) {
 很简单，就是调用了fs.readSync，我们看下它的实现
 ```js
 // 文件位置：/lib/fs.js
-// 这里的源码列出了readSync的两种调用方式：
-// usage:
-// fs.readSync(fd, buffer, offset, length, position);
-// OR
-// fs.readSync(fd, buffer, {}) or fs.readSync(fd, buffer)
 function readSync(fd, buffer, offset, length, position) {
   ...
   // 参数校验和准备工作
@@ -192,7 +194,91 @@ function readSync(fd, buffer, offset, length, position) {
 }
 ```
 
-可以看出，这里最终调用了build-in模块的read方法。我们看下它的实现。
+可以看出，这里最终调用了build-in模块的read方法。
+> 注意第六个参数为undefined。
+
+### 1.2 异步调用
+先看入口方法：
+```js
+// 文件位置：/lib/fs.js
+// 异步
+function readFile(path, options, callback) {
+  ...
+  const context = new ReadFileContext(callback, options.encoding);
+  const req = new FSReqCallback();
+  req.context = context;
+  req.oncomplete = readFileAfterOpen;
+  binding.open(pathModule.toNamespacedPath(path), flagsNumber, 0o666, req);
+}
+```
+可以看出，这里初始化了一个FSReqCallback实例req；然后调用了build-in模块的open方法来打开文件；打开后，它就会调用回调req.oncomplete；
+> 文件读取无外乎open, stat, read三个步骤；
+>这三个步骤依次调用，都是通过初始化一个FSReqCallback实例req；当前阶段完成后，然后调用它的req.oncomplete。
+
+我们看第一阶段，open后，执行req.oncomplete，即readFileAfterOpen。
+
+```js
+// 文件位置: /lib/fs.js
+function readFileAfterOpen(err, fd) {
+  const context = this.context;
+  ...
+
+  const req = new FSReqCallback();
+  req.oncomplete = readFileAfterStat;
+  req.context = context;
+  binding.fstat(fd, false, req);
+}
+```
+
+这里也初始化了一个FSReqCallback实例req。接着调用fstat,读取文件元信息后，执行了回调req.oncomplete，即readFileAfterStat；
+
+```js
+// 文件位置：/lib/fs.js
+function readFileAfterStat(err, stats) {
+  const context = this.context;
+  ...
+  context.read();
+}
+```
+
+这里的context的read方法是什么呢？
+
+我们回顾一下readFile中是怎么初始化context的。
+
+```js
+// 文件位置：/lib/fs.js
+function readFile(path, options, callback) {
+  ...
+    ReadFileContext = require('internal/fs/read_file_context');
+  const context = new ReadFileContext(callback, options.encoding);
+  ...
+}
+```
+
+所以context.read方法就在internal/fs/read_file_context.js中。
+```js
+// 文件位置：/lib/internal/fs/read_file_context.js
+read() {
+    ...
+
+    const req = new FSReqCallback();
+    req.oncomplete = readFileAfterRead;
+    req.context = this;
+    // 这里的read方法，和同步方法中的binding.read是统一个方法，即/src/node_file.cc中的Read
+    read(this.fd, buffer, offset, length, -1, req);
+  }
+```
+
+综上，无论是同步，还是异步，最终都汇总到了/src/node_file.c中的Read方法。
+
+于是我们的全局流程图来到了这里：
+
+![c++Read](./img/fsTwoPath.png)
+
+## 2.C++中的Read接手
+
+从上面一节，我们知道，两个方法，最终都调用/src/node_file.c中的Read方法；
+我们看下它的实现。
 
 ```c++
 // 文件位置：/src/node_file.cc
