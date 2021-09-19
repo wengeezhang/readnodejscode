@@ -143,10 +143,11 @@ fs.readFileSync 对应故事章节中的“方式1”；fs.readFile 对应故事
 
 > 由于两个方法关联性很强，所以我们采取并行解读的方式
 
-## 1.入口：
+## 同步和异步方式
+### 1.入口
 
 ![入口](./img/fsTwoPath.png)
-### 1.1 同步调用
+#### 1.1 同步调用
 ```js
 // 文件位置：/lib/fs.js
 // 同步
@@ -197,7 +198,7 @@ function readSync(fd, buffer, offset, length, position) {
 可以看出，这里最终调用了build-in模块的read方法。
 > 注意第六个参数为undefined。
 
-### 1.2 异步调用
+#### 1.2 异步调用
 先看入口方法：
 ```js
 // 文件位置：/lib/fs.js
@@ -275,7 +276,7 @@ read() {
 
 ![c++Read](./img/fsTwoPath.png)
 
-## 2.C++中的Read接手
+### 2.C++中的Read
 
 从上面一节，我们知道，两个方法，最终都调用/src/node_file.c中的Read方法；
 我们看下它的实现。
@@ -302,14 +303,19 @@ static void Read(const FunctionCallbackInfo<Value>& args) {
 }
 ```
 
-Read方法也是比较简单，通过判断是否有第六个参数（index=5）来判断是同步调用还是异步调用。如果是前者，则调用SyncCall；否则调用AsyncCall。
+Read方法也是比较简单，通过判断是否有第六个参数（index=5），来判断是同步调用还是异步调用。如果有，则调用AsyncCall；否则SyncCall。
 > fs.readFileSync('xx')最终调用c++的方式为const result = binding.read(fd, buffer, offset, length, position,undefined, ctx);
 > 
 > 这里第六个参数（index=5）为undefined
 
-我们这里分析同步调用，所以看SyncCall。重点关注第5个参数（index=4）: uv_fs_read。
+于是我们的全局流程图来到了这里：
 
-下面是SyncCall的实现（参数uv_fs_read对应下面代码中的fn）。
+![c++Read](./img/fsTwoPath.png)
+
+### 3.SyncCall 和AsyncCall
+先看SyncCall，重点关注第5个参数（index=4），uv_fs_read：
+
+>下面是SyncCall的实现（参数uv_fs_read对应下面代码中的fn）。
 ```c++
 // 文件位置：/src/node_file.inl.h
 int SyncCall(Environment* env, v8::Local<v8::Value> ctx,
@@ -322,7 +328,47 @@ int SyncCall(Environment* env, v8::Local<v8::Value> ctx,
 }
 ```
 
-可以看出，SyncCall就是调用了uv_fs_read方法。这个是libuv封装的一个文件读方法。
+可以看出，SyncCall就是调用了uv_fs_read方法。
+
+再看AsyncCall：
+```c++
+// 文件位置：/src/node_file.inl.h
+FSReqBase* AsyncCall(Environment* env,
+                     FSReqBase* req_wrap,
+                     const v8::FunctionCallbackInfo<v8::Value>& args,
+                     const char* syscall, enum encoding enc,
+                     uv_fs_cb after, Func fn, Args... fn_args) {
+  return AsyncDestCall(env, req_wrap, args,
+                       syscall, nullptr, 0, enc,
+                       after, fn, fn_args...);
+}
+
+// 调用了AsyncDestCall:
+FSReqBase* AsyncDestCall(Environment* env, FSReqBase* req_wrap,
+                         const v8::FunctionCallbackInfo<v8::Value>& args,
+                         const char* syscall, const char* dest,
+                         size_t len, enum encoding enc, uv_fs_cb after,
+                         Func fn, Args... fn_args) {
+  CHECK_NOT_NULL(req_wrap);
+  req_wrap->Init(syscall, dest, len, enc);
+  int err = req_wrap->Dispatch(fn, fn_args..., after);
+  ...
+  return req_wrap;
+}
+```
+
+可以看出，这里的调用流程为：AsyncDestCall -> AsyncDestCall -> req_wrap->Dispatch(fn, fn_args..., after)。
+
+这里触发了一个Dispatch(fn,...);其中fn也就是uv_fs_read。
+
+所以，无论是SyncCall还是AsyncCall, 最终又收归一处，调用uv_fs_read。
+
+于是我们的全局流程图来到了这里：
+
+![c++Read](./img/fsTwoPath.png)
+
+### 4. uv_fs_read
+这个是libuv封装的一个文件读方法。
 
 我们看下uv_fs_read方法：
 ```c++
@@ -354,6 +400,11 @@ int uv_fs_read(uv_loop_t* loop, uv_fs_t* req,
   POST;
 }
 ```
+于是我们的全局流程图来到了这里：
+
+![c++Read](./img/fsTwoPath.png)
+
+### 5.POST
 
 这里有一个宏：POST，它的代码如下：
 ```c++
@@ -376,28 +427,30 @@ int uv_fs_read(uv_loop_t* loop, uv_fs_t* req,
   }                                                                           \
   while (0)
 ```
-我们知道：
-* 异步调用：AsyncCall(env, req_wrap_async, args, "read", UTF8, AfterInteger,
-              uv_fs_read, fd, &uvbuf, 1, pos);
-AsyncCall调用了return AsyncDestCall(env, req_wrap, args, syscall, nullptr, 0, enc, after, fn, fn_args...);
 
-AsyncDestCall调用了
-int err = req_wrap->Dispatch(fn, fn_args..., after);
+根据前面的章节，我们知道：
 
-* 同步调用：SyncCall(env, args[6], &req_wrap_sync, "read",uv_fs_read, fd, &uvbuf, 1, pos);
-SyncCall中调用了：int err = fn(env->event_loop(), &(req_wrap->req), args..., nullptr);
-在同步方法中，传递给uv_fs_read的最后一个参数是nullptr；
-所以这里POST命中else分支
+* 同步调用：fn(env->event_loop(), &(req_wrap->req), args..., nullptr);
+* 异步调用：req_wrap->Dispatch(fn, fn_args..., after);
+
 
 总结一下：
-* 异步调用uv_fs_read传递的是：fn_args..., after
+
 * 同步调用uv_fs_read传递的是：args..., nullptr
+* 异步调用uv_fs_read传递的是：fn_args..., after
 
 
 所以，在POST宏中：
-* 如果是异步调用，则走if分支，即uv__work_submit(...);return 0;
-* 如果是同步调用，则走else分支，即uv__fs_work(&req->work_req);return req->result;  
 
+* 如果是同步调用，则走else分支，即uv__fs_work(&req->work_req);return req->result;  
+* 如果是异步调用，则走if分支，即uv__work_submit(...);return 0;
+
+于是我们的全局流程图来到了这里：
+
+![c++Read](./img/fsTwoPath.png)
+
+>也就是从这里开始，两种方式彻底分开来，不会再有公用交叉的地方。
+### 6. 同步方式最后调用uv__fs_work
 
 ```c++
 // 文件位置：/deps/uv/src/unix/fs.c
@@ -426,6 +479,14 @@ static ssize_t uv__fs_read(uv_fs_t* req) {
 }
 ```
 
+可见，同步方式比较简单直接，最终调用系统read读取数据，并返回。
+
+此时，同步方式的调用流程完结，如下图：
+
+![c++Read](./img/fsTwoPath.png)
+
+### 7. 异步方式调用uv__work_submit
+
 上面讲解了同步，我们看异步。POST调用了uv__work_submit：
 
 ```c++
@@ -448,26 +509,68 @@ void uv__work_submit(uv_loop_t* loop,
 * 准备工作
 * 调用post，往相关的队列中插入任务
 
-其中看第一个点，初始化线程池：
+其中看第一个点，初始化线程池；第三个点是把当前任务插入任务，供线程池消费。
+
+我们先看第三个点。
+
+
+于是我们的全局流程图来到了这里：
+
+![c++Read](./img/fsTwoPath.png)
+
+### 8.将当前读取任务插入到队列
+
+第三个点，往队列中插入任务。然后线程池中的线程就会不断循环读取，只要有，便执行
+```c++
+// 文件位置：/deps/uv/src/threadpool.c
+// QUEUE_INSERT_TAIL
+static void post(QUEUE* q, enum uv__work_kind kind) {
+  uv_mutex_lock(&mutex);
+  if (kind == UV__WORK_SLOW_IO) {
+    /* Insert into a separate queue. */
+    QUEUE_INSERT_TAIL(&slow_io_pending_wq, q);
+    if (!QUEUE_EMPTY(&run_slow_work_message)) {
+      /* Running slow I/O tasks is already scheduled => Nothing to do here.
+         The worker that runs said other task will schedule this one as well. */
+      uv_mutex_unlock(&mutex);
+      return;
+    }
+    q = &run_slow_work_message;
+  }
+
+  QUEUE_INSERT_TAIL(&wq, q);
+  if (idle_threads > 0)
+    uv_cond_signal(&cond);
+  uv_mutex_unlock(&mutex);
+}
+```
+
+
+于是我们的全局流程图来到了这里：
+
+![c++Read](./img/fsTwoPath.png)
+
+### 9. 初始化线程池
+
+>注意，初始化线程池是一个惰性行为，即进程启动时，并没有完成初始化。而是当有相关操作发生（比如读取文件），才会初始化；
+>不过这个初始化只有一次，后续不会再发生。
+
+我们看下初始化工作：
+
 ```c++
 // 文件位置：/deps/uv/src/unix/thread.c
 void uv_once(uv_once_t* guard, void (*callback)(void)) {
   if (pthread_once(guard, callback))
     abort();
 }
+```
 
-// 这里的callback就是init_once
+这里的callback就是init_once
 
+```c++
 // 文件位置：/deps/uv/src/threadpool.c
 static void init_once(void) {
-#ifndef _WIN32
-  /* Re-initialize the threadpool after fork.
-   * Note that this discards the global mutex and condition as well
-   * as the work queue.
-   */
-  if (pthread_atfork(NULL, NULL, &reset_once))
-    abort();
-#endif
+  ...
   init_threads();
 }
 
@@ -484,9 +587,12 @@ static void init_threads(void) {
       abort();
   ...
 }
+```
 
-// 这里调用uv_thread_create创建一个线程。其中第二个参数worker就是要执行的任务。我们看下它的代码：
+可以看到，这里调用uv_thread_create创建了nthreads（默认为4）个线程。其中第二个参数worker就是要执行的任务。我们看下它的代码：
 
+```c++
+// 文件位置：/deps/uv/src/threadpool.c
 static void worker(void* arg) {
   ...
   // 可以看到，这里就是在执行一个无限循环
@@ -525,9 +631,19 @@ static void worker(void* arg) {
     ...
   }
 }
+```
 
-// 这里的工作比较简单，就是循环等待，当有任务时，执行，然后通过uv_async_send通知主线程
+这里的工作比较简单，就是循环等待，当有任务时，执行，然后通过uv_async_send通知主线程
 
+于是我们的全局流程图来到了这里：
+
+![c++Read](./img/fsTwoPath.png)
+
+### 10. 任务完成，通知主进程（uv__async_send）
+
+上面无限循环中，当完成任务后，调用了uv_async_send，它就是用来通知主线程的。
+
+```c++
 // 文件位置： /deps/uv/src/unix/async.c
 int uv_async_send(uv_async_t* handle) {
   ...
@@ -552,33 +668,15 @@ static void uv__async_send(uv_loop_t* loop) {
 }
 ```
 
-第三个点，往队列中插入任务。然后线程池中的线程就会不断循环读取，只要有，便执行
-```c++
-// 文件位置：/deps/uv/src/threadpool.c
-// QUEUE_INSERT_TAIL
-static void post(QUEUE* q, enum uv__work_kind kind) {
-  uv_mutex_lock(&mutex);
-  if (kind == UV__WORK_SLOW_IO) {
-    /* Insert into a separate queue. */
-    QUEUE_INSERT_TAIL(&slow_io_pending_wq, q);
-    if (!QUEUE_EMPTY(&run_slow_work_message)) {
-      /* Running slow I/O tasks is already scheduled => Nothing to do here.
-         The worker that runs said other task will schedule this one as well. */
-      uv_mutex_unlock(&mutex);
-      return;
-    }
-    q = &run_slow_work_message;
-  }
 
-  QUEUE_INSERT_TAIL(&wq, q);
-  if (idle_threads > 0)
-    uv_cond_signal(&cond);
-  uv_mutex_unlock(&mutex);
-}
-```
+此时，异步方式读取完成，流程图如下：
 
-总结下两个路线图：
-![路线图](./img/fsTwoPath.png)
+![c++Read](./img/fsTwoPath.png)
+
+
+## 流式方式
+
+
 
 1.readFile会调用read,read:
 ```js
