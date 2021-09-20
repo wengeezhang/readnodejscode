@@ -139,14 +139,14 @@ fs.readFileSync 对应故事章节中的“方式1”；fs.readFile 对应故事
 我们先给出一个流程图，从全局视角看下两种方式的区别和联系：
 >用户读不懂没关系，我们接下来会一一解读。
 
-![fs整体流程图](./img/fsTwoPath.png)
+![fs整体流程图](./img_unit/unit/unit.048.png)
 
 > 由于两个方法关联性很强，所以我们采取并行解读的方式
 
 ## 同步和异步方式
 ### 1.入口
 
-![入口](./img/fsTwoPath.png)
+![入口](./img_unit/unit/unit.049.png)
 #### 1.1 同步调用
 ```js
 // 文件位置：/lib/fs.js
@@ -274,7 +274,7 @@ read() {
 
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.050.png)
 
 ### 2.C++中的Read
 
@@ -310,7 +310,7 @@ Read方法也是比较简单，通过判断是否有第六个参数（index=5）
 
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.051.png)
 
 ### 3.SyncCall 和AsyncCall
 先看SyncCall，重点关注第5个参数（index=4），uv_fs_read：
@@ -365,7 +365,7 @@ FSReqBase* AsyncDestCall(Environment* env, FSReqBase* req_wrap,
 
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.052.png)
 
 ### 4. uv_fs_read
 这个是libuv封装的一个文件读方法。
@@ -402,7 +402,7 @@ int uv_fs_read(uv_loop_t* loop, uv_fs_t* req,
 ```
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.053.png)
 
 ### 5.POST
 
@@ -447,7 +447,7 @@ int uv_fs_read(uv_loop_t* loop, uv_fs_t* req,
 
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.054.png)
 
 >也就是从这里开始，两种方式彻底分开来，不会再有公用交叉的地方。
 ### 6. 同步方式最后调用uv__fs_work
@@ -483,13 +483,14 @@ static ssize_t uv__fs_read(uv_fs_t* req) {
 
 此时，同步方式的调用流程完结，如下图：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.055.png)
 
 ### 7. 异步方式调用uv__work_submit
 
 上面讲解了同步，我们看异步。POST调用了uv__work_submit：
 
 ```c++
+// 文件位置：/deps/uv/src/threadpool.c
 void uv__work_submit(uv_loop_t* loop,
                      struct uv__work* w,
                      enum uv__work_kind kind,
@@ -509,14 +510,15 @@ void uv__work_submit(uv_loop_t* loop,
 * 准备工作
 * 调用post，往相关的队列中插入任务
 
-其中看第一个点，初始化线程池；第三个点是把当前任务插入任务，供线程池消费。
+其中看第一个点，初始化线程池(这个动作只执行一次，后续不再执行)
+第三个点是把当前任务插入任务，供线程池消费。
 
-我们先看第三个点。
+我们假设第一个点已经执行过，直接看第三个点。
 
 
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.056.png)
 
 ### 8.将当前读取任务插入到队列
 
@@ -548,7 +550,7 @@ static void post(QUEUE* q, enum uv__work_kind kind) {
 
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.057.png)
 
 ### 9. 初始化线程池
 
@@ -637,7 +639,7 @@ static void worker(void* arg) {
 
 于是我们的全局流程图来到了这里：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.058.png)
 
 ### 10. 任务完成，通知主进程（uv__async_send）
 
@@ -671,7 +673,7 @@ static void uv__async_send(uv_loop_t* loop) {
 
 此时，异步方式读取完成，流程图如下：
 
-![c++Read](./img/fsTwoPath.png)
+![c++Read](./img_unit/unit/unit.059.png)
 
 
 ## 流式方式
