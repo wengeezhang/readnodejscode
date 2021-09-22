@@ -690,7 +690,7 @@ readerStream.on('data', function(chunk) {
 });
 ```
 
-从样例中，我们看到，这里创建一个可读流，然后监听data就可以消费了。
+从样例中，我们看到，这里创建一个可读流，然后对其监听data事件就可以消费了。
 我们看下createReadStream的实现。
 
 ```js
@@ -708,13 +708,13 @@ function lazyLoadStreams() {
 }
 ```
 很简单:
-* 加载可读流的实现类（ReadStream）
+* 加载可读流的实现类（调用lazyLoadStreams，加载ReadStream）
 * 创建一个ReadStream实例，并返回。
 
 所以，fs.createReadStream本质就是创建一个ReadStream（/lib/internal/fs/streams.js）的实例。
 
 ### 2.ReadStream
-ReadStream是对基类Stream封装的一个方法，我们看下它的实现
+ReadStream是对基类Stream的Readable进行了封装，我们看下它的实现
 
 > 关于流Stream的详细运作原理和使用解读，将在下一章节“nodejs流”展开。本章主要介绍fs模块封装的流。
 
@@ -736,9 +736,9 @@ ObjectSetPrototypeOf(ReadStream.prototype, Readable.prototype);
 ObjectSetPrototypeOf(ReadStream, Readable);
 ```
 
-可见，ReadStream类，其实就是继承了Readable。
+可见，ReadStream 类，其实就是继承了Readable。
 
-Readable是什么呢？它就是最基础Stream的一个可读流类（构造函数）
+Readable是什么呢？它是基础Stream的一个可读流类（构造函数）
 
 ```js
 const { Readable, Writable, finished } = require('stream');
@@ -794,7 +794,7 @@ function Readable(options) {
 其实Readable构造函数很简单，大家先记住两点：
 
 1. 初始化内部状态属性this._readableState
-2. 调用events，拥有.on .emit的事件能力。
+2. 调用events（Stream.call()），拥有.on .emit的事件能力。
 
 > 由于本章节聚焦文件读取，所以这里只解读【文件流】的实现。想要了解流的所有底层原理，请移步下一章节。
 
@@ -817,13 +817,13 @@ readerStream.on('data', function(chunk) {
    data += chunk;
 });
 ```
-当操作系统底层完成文件读取后，变化触发一个事件，被这里捕获，执行回调。
+当操作系统底层完成文件读取后，变化触发一个"data"事件，被这里捕获，执行回调。
 
 于是文件内容源源不断地累加到变量data中。
 
 这里有些用户会有疑问：
-* 操作系统是怎么源源不断地读取文件呢？
-* 看样例代码，并没有显示说明要怎么读取，读取频率又是怎么控制的？
+* 操作系统是怎么触发data事件的？
+* 底层是怎么源源不断地读取文件？频率是怎么样的呢？
 
 要回答这个问题，我们就要进一步，看下.on到底感受啥。
 
@@ -844,7 +844,7 @@ Readable.prototype.on = function(ev, fn) {
 };
 ```
 
-可见，这里.on除了调用events的.on外，还调用了this.resume()方法，这个方法就是启动流的读取工作。
+这里.on做了两个事情：除了调用events的.on外，还调用了this.resume()方法，这个方法就是启动流的读取工作。
 
 resume是一连串的调用，核心就是最后触发一个循环，不断调用操作系统的读取接口，进行读取。
 
@@ -874,14 +874,90 @@ function flow(stream) {
 ```
 > 注：我们忽略了很多判断代码，主要讲解核心流程。详细代码解读，请移步下一章节“nodejs流”。
 
-可以看到，这里执行了一个while循环，调用stream.read方法。
+可以看到，这里flow执行了一个while循环，调用stream.read方法。
 
 具体到文件流，这个read方法是什么呢？
 
-由于fs.createReadStream是返回/lib/internal/fs/stream.js中ReadStream实例,因此这里this.read就是ReadStream的原型方法read。
+由于fs.createReadStream是返回/lib/internal/fs/stream.js中ReadStream实例,因此这里this.read就是ReadStream的原型链上的方法read。
+
+查看/lib/internal/fs/stream.js的代码，ReadStream上并没有直接定义read，因此我们沿着原型链，继续往上查找，找到ReadStream的父类Readable(/lib/_stream_readable.js),它有定义一个read方法。
+
 
 ```js
-ReadStream
+// 文件位置：/lib/_stream_readable.js
+Readable.prototype.read = function(n) {
+  ...
+  this._read(state.highWaterMark);
+  ...
+};
+
+
+Readable.prototype._read = function(n) {
+  throw new ERR_METHOD_NOT_IMPLEMENTED('_read()');
+};
+```
+
+从上面代码看出，Readable的read方法，调用了_read。然而Readable自身并没有提供_read方法。
+
+> _stream_readable.js是最基础的可读流类，它存在的意义是指定流的运作模式；
+> 至于读取的实际操作，因为不同的使用场景（读取文件，读取网络内容）而不同，所以它没有任何实现
+
+这个_read方法，其实是有使用场景（读取文件，读取网络内容）来指定的；也即是说/lib/internal/fs/stream.js这个使用场景，必须提供_read方法。
+
+查看/lib/internal/fs/stream.js，确实存在一个_read方法，我们看下它的实现：
+
+```js
+//文件位置： /lib/internal/fs/stream.js
+ReadStream.prototype._read = function(n) {
+  // the actual read.
+  this[kFs].read(
+    this.fd, pool, pool.used, toRead, this.pos, (er, bytesRead) => {
+      ...
+      if (er) {
+        ...
+      } else {
+        let b = null;
+        ...
+          b = thisPool.slice(start, start + bytesRead);
+        ...
+        this.push(b);
+      }
+    });
+
+  ...
+};
+```
+
+代码比较简单：
+* 调用this[kFs].read,读取文件；（这里的this[kFs]，就是/lib/fs.js模块；即调用fs的read方法）
+* 读取到内容后，读取到内容后，执行push操作
+
+>提示：
+>```js
+>// 文件位置：/li/internal/fs/stream.js
+>...
+>const fs = require('fs');
+>...
+>function ReadStream(path, options) {
+>  ...
+>  this[kFs] = options.fs || fs;
+>  ...
+>```
+
+所以，ReadStream.prototype._read，最终调用的就是fs模块的read方法，即异步读取文件的方式。
+> 异步读取文件的方式，本章节前面已经分析过。
+
+小结：
+文件读取流的工作方式，可总结为下面的流程
+* 初始化一个ReadStream实例
+* 调用.on, 监听data事件
+  * 调用this.resume()，启动一个flow（无限循环）
+  * 无限循环中不断调用read方法
+    * read调用业务指定的_read
+    * _read方法调用fs模块的read，异步读取文件
+    * 然后把内容push出去
+
+那么push方法是什么呢？我们看下它的实现
 
 
 
@@ -955,38 +1031,6 @@ FSReqBase* GetReqWrap(const v8::FunctionCallbackInfo<v8::Value>& args,
 
 
 
-
-```js
-ReadStream.prototype._read = function(n) {
-  ...
-
-  // Grab another reference to the pool in the case that while we're
-  // in the thread pool another read() finishes up the pool, and
-  // allocates a new one.
-  const thisPool = pool;
-  
-  this[kFs].read(
-    this.fd, pool, pool.used, toRead, this.pos, (er, bytesRead) => {
-      
-
-      if (er) {
-        ...
-      } else {
-        let b = null;
-        ...
-        
-
-        if (bytesRead > 0) {
-          this.bytesRead += bytesRead;
-          b = thisPool.slice(start, start + bytesRead);
-        }
-        // this.push就是调用stream.push方法，调用addChunk
-        this.push(b);
-      }
-    });
-    ...
-};
-```
 
 
 ```js
