@@ -677,6 +677,219 @@ static void uv__async_send(uv_loop_t* loop) {
 
 
 ## 流式方式
+在故事章节中，我们知道，要想解决大文件的读取，就得采取流式读取方式。接下来我们解读源码。
+
+### 1.入口
+平时我们使用的文件读取流是封装好的，即fs.createReadStream：
+```js
+// 样例
+let data = ``;
+var readerStream = fs.createReadStream('some.txt');
+readerStream.on('data', function(chunk) {
+   data += chunk;
+});
+```
+
+从样例中，我们看到，这里创建一个可读流，然后监听data就可以消费了。
+我们看下createReadStream的实现。
+
+```js
+// 文件位置：/lib/fs.js
+function createReadStream(path, options) {
+  lazyLoadStreams();
+  return new ReadStream(path, options);
+}
+
+function lazyLoadStreams() {
+  if (!ReadStream) {
+    ({ ReadStream, WriteStream } = require('internal/fs/streams'));
+    [ FileReadStream, FileWriteStream ] = [ ReadStream, WriteStream ];
+  }
+}
+```
+很简单:
+* 加载可读流的实现类（ReadStream）
+* 创建一个ReadStream实例，并返回。
+
+所以，fs.createReadStream本质就是创建一个ReadStream（/lib/internal/fs/streams.js）的实例。
+
+### 2.ReadStream
+ReadStream是对基类Stream封装的一个方法，我们看下它的实现
+
+> 关于流Stream的详细运作原理和使用解读，将在下一章节“nodejs流”展开。本章主要介绍fs模块封装的流。
+
+```js
+// 文件位置：/lib/internal/fs/stream.js
+
+function ReadStream(path, options) {
+  ...// 检测
+  this[kFs] = options.fs || fs;
+  ...
+
+  Readable.call(this, options);
+
+  // 初始化设置属性
+  ...
+}
+
+ObjectSetPrototypeOf(ReadStream.prototype, Readable.prototype);
+ObjectSetPrototypeOf(ReadStream, Readable);
+```
+
+可见，ReadStream类，其实就是继承了Readable。
+
+Readable是什么呢？它就是最基础Stream的一个可读流类（构造函数）
+
+```js
+const { Readable, Writable, finished } = require('stream');
+```
+
+小结一下：
+* fs.createReadStream()，其实就是返回了一个Readable实例
+
+我们看下Readable的实现。
+
+```js
+// 文件位置：/lib/stream.js
+...
+const Stream = module.exports = require('internal/streams/legacy');
+
+Stream.Readable = require('_stream_readable');
+Stream.Writable = require('_stream_writable');
+...
+```
+
+>Stream是一个基类，它很简单，就是继承events而已(外加一个pipe方法，这里不做延展，在下一章节解读)
+>```js
+>// 文件位置：/lib/internal/streams/legacy.js
+>const EE = require('events');
+>
+>function Stream(opts) {
+>  EE.call(this, opts);
+>}
+>ObjectSetPrototypeOf(Stream.prototype, EE.prototype);
+>ObjectSetPrototypeOf(Stream, EE);
+>```
+这里Stream.Readable,是一个普通的构造函数，位于/lib/_stream_readable.js。我们来看下。
+
+```js
+// 文件位置：/lib/_stream_readable
+function Readable(options) {
+  ...
+  // 1.设置状态属性，后续的数据会存放在这里
+  this._readableState = new ReadableState(options, this, isDuplex);
+
+  // 2.设置_read方法（_destroy同理）
+  if (options) {
+    if (typeof options.read === 'function')
+      this._read = options.read;
+
+    if (typeof options.destroy === 'function')
+      this._destroy = options.destroy;
+  }
+  // 3. 执行Stream主体，本质就是拥有events的各种能力（监听，触发事件）
+  Stream.call(this, options);
+}
+```
+其实Readable构造函数很简单，大家先记住两点：
+
+1. 初始化内部状态属性this._readableState
+2. 调用events，拥有.on .emit的事件能力。
+
+> 由于本章节聚焦文件读取，所以这里只解读【文件流】的实现。想要了解流的所有底层原理，请移步下一章节。
+
+到此为止，我们发现fs.createReadStream做完了两件事：
+
+* 初始化一个Readable实例，并返回
+* 继承events，让Readable实例具备.on .emit等方法
+
+接下里就是对Readable实例做处理
+
+### 3.消费可读流
+
+有了.on方法，我们便可以监听消费Readable实例：
+
+```js
+// 样例
+let data = ``;
+var readerStream = fs.createReadStream('some.txt');
+readerStream.on('data', function(chunk) {
+   data += chunk;
+});
+```
+当操作系统底层完成文件读取后，变化触发一个事件，被这里捕获，执行回调。
+
+于是文件内容源源不断地累加到变量data中。
+
+这里有些用户会有疑问：
+* 操作系统是怎么源源不断地读取文件呢？
+* 看样例代码，并没有显示说明要怎么读取，读取频率又是怎么控制的？
+
+要回答这个问题，我们就要进一步，看下.on到底感受啥。
+
+```js
+Readable.prototype.on = function(ev, fn) {
+  const res = Stream.prototype.on.call(this, ev, fn);
+  const state = this._readableState;
+
+  if (ev === 'data') {
+    ...
+    if (state.flowing !== false)
+      this.resume();
+  } else if (ev === 'readable') {
+    ...
+  }
+
+  return res;
+};
+```
+
+可见，这里.on除了调用events的.on外，还调用了this.resume()方法，这个方法就是启动流的读取工作。
+
+resume是一连串的调用，核心就是最后触发一个循环，不断调用操作系统的读取接口，进行读取。
+
+```js
+Readable.prototype.resume = function() {
+  ...
+    resume(this, state);
+  ...
+};
+
+function resume(stream, state) {
+  ...
+    process.nextTick(resume_, stream, state);
+  ...
+}
+
+function resume_(stream, state) {
+  ...
+  flow(stream);
+  ...
+}
+
+function flow(stream) {
+  ...
+  while (state.flowing && stream.read() !== null);
+}
+```
+> 注：我们忽略了很多判断代码，主要讲解核心流程。详细代码解读，请移步下一章节“nodejs流”。
+
+可以看到，这里执行了一个while循环，调用stream.read方法。
+
+具体到文件流，这个read方法是什么呢？
+
+由于fs.createReadStream是返回/lib/internal/fs/stream.js中ReadStream实例,因此这里this.read就是ReadStream的原型方法read。
+
+```js
+ReadStream
+
+
+
+
+
+
+
+
 
 
 
@@ -737,103 +950,11 @@ FSReqBase* GetReqWrap(const v8::FunctionCallbackInfo<v8::Value>& args,
 }
 ```
 
-AyncCall调用了AsyncDestCall
-```c++
-FSReqBase* AsyncCall(Environment* env,
-                     FSReqBase* req_wrap,
-                     const v8::FunctionCallbackInfo<v8::Value>& args,
-                     const char* syscall, enum encoding enc,
-                     uv_fs_cb after, Func fn, Args... fn_args) {
-  return AsyncDestCall(env, req_wrap, args,
-                       syscall, nullptr, 0, enc,
-                       after, fn, fn_args...);
-}
-
-
-
-FSReqBase* AsyncDestCall(Environment* env, FSReqBase* req_wrap,
-                         const v8::FunctionCallbackInfo<v8::Value>& args,
-                         const char* syscall, const char* dest,
-                         size_t len, enum encoding enc, uv_fs_cb after,
-                         Func fn, Args... fn_args) {
-  CHECK_NOT_NULL(req_wrap);
-  req_wrap->Init(syscall, dest, len, enc);
-  int err = req_wrap->Dispatch(fn, fn_args..., after);
-  if (err < 0) {
-    uv_fs_t* uv_req = req_wrap->req();
-    uv_req->result = err;
-    uv_req->path = nullptr;
-    after(uv_req);  // after may delete req_wrap if there is an error
-    req_wrap = nullptr;
-  } else {
-    req_wrap->SetReturnValue(args);
-  }
-
-  return req_wrap;
-}
-```
-
-这里的req_wrap触发了一个Dispatch,即向线程池派发一个任务，完成后，调用fn，即uv_fs_read。
-
-uv_fs_read会通过POST通知主线程。
 
 
 
 
 
-
-
-* 第一步：先初始化一个context，后续很多回调都会挂在这里。
-* 第二步：初始化一个req:const req = new FSReqCallback();把回调callback挂在这里。
-* 然后把context挂在到req上。req.context = context;req.oncomplete = readFileAfterOpen;
-* 调用binding.open方法（binding就是c++的fs模块）
-* open后，触发readFileAfterOpen， readFileAfterStat，最后来到binding.read方法。
-* binding.read就是c++模块的Read方法，它通过判断是否是异步，最后调用AsyncCall AsyncCall(env, req_wrap_async, args, "read", UTF8, AfterInteger,uv_fs_read, fd, &uvbuf, 1, pos);
-
-* AsyncCall的第七个参数uv_fs_read将会被调用，这个函数为：
-```c++
-int uv_fs_stat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
-  INIT(STAT);
-  PATH;
-  POST;
-}
-```
-
-POST为宏，它很简单，调用了 uv__work_submit
-
-```c++
-#define POST                                                                  \
-  do {                                                                        \
-    if (cb != NULL) {                                                         \
-      uv__req_register(loop, req);                                            \
-      uv__work_submit(loop,                                                   \
-                      &req->work_req,                                         \
-                      UV__WORK_FAST_IO,                                       \
-                      uv__fs_work,                                            \
-                      uv__fs_done);                                           \
-      return 0;                                                               \
-    }                                                                         \
-    else {                                                                    \
-      uv__fs_work(&req->work_req);                                            \
-      return req->result;                                                     \
-    }                                                                         \
-  }                                                                           \
-  while (0)
-```
-```js
-// 文件位置：/lib/fs.js
-function lazyLoadStreams() {
-  if (!ReadStream) {
-    ({ ReadStream, WriteStream } = require('internal/fs/streams'));
-    [ FileReadStream, FileWriteStream ] = [ ReadStream, WriteStream ];
-  }
-}
-
-function createReadStream(path, options) {
-  lazyLoadStreams();
-  return new ReadStream(path, options);
-}
-```
 
 ```js
 ReadStream.prototype._read = function(n) {
