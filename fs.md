@@ -809,6 +809,7 @@ function Readable(options) {
 
 有了.on方法，我们便可以监听消费Readable实例：
 
+#### 3.1 .on
 ```js
 // 样例
 let data = ``;
@@ -822,8 +823,8 @@ readerStream.on('data', function(chunk) {
 于是文件内容源源不断地累加到变量data中。
 
 这里有些用户会有疑问：
-* 操作系统是怎么触发data事件的？
-* 底层是怎么源源不断地读取文件？频率是怎么样的呢？
+* 底层是怎么不停歇地读取文件呢？
+* 读取一次后，是怎么触发data事件的？
 
 要回答这个问题，我们就要进一步，看下.on到底感受啥。
 
@@ -844,9 +845,11 @@ Readable.prototype.on = function(ev, fn) {
 };
 ```
 
-这里.on做了两个事情：除了调用events的.on外，还调用了this.resume()方法，这个方法就是启动流的读取工作。
+这里.on做了两个事情：
+* 调用events的.on,监听data事件
+* 还调用了this.resume()方法，这个方法就是启动流的读取工作。
 
-resume是一连串的调用，核心就是最后触发一个循环，不断调用操作系统的读取接口，进行读取。
+resume是一连串的调用，核心就是触发一个循环，不断调用操作系统的读取接口，进行读取。
 
 ```js
 Readable.prototype.resume = function() {
@@ -878,6 +881,7 @@ function flow(stream) {
 
 具体到文件流，这个read方法是什么呢？
 
+#### 3.2 read和_read
 由于fs.createReadStream是返回/lib/internal/fs/stream.js中ReadStream实例,因此这里this.read就是ReadStream的原型链上的方法read。
 
 查看/lib/internal/fs/stream.js的代码，ReadStream上并没有直接定义read，因此我们沿着原型链，继续往上查找，找到ReadStream的父类Readable(/lib/_stream_readable.js),它有定义一个read方法。
@@ -897,12 +901,19 @@ Readable.prototype._read = function(n) {
 };
 ```
 
-从上面代码看出，Readable的read方法，调用了_read。然而Readable自身并没有提供_read方法。
+从上面代码看出，Readable的read方法，调用了_read。
+
+这个_read，就是我们要寻找的最终读取文件的方法。
+
+然而Readable自身并没有提供_read方法。
 
 > _stream_readable.js是最基础的可读流类，它存在的意义是指定流的运作模式；
-> 至于读取的实际操作，因为不同的使用场景（读取文件，读取网络内容）而不同，所以它没有任何实现
+> 至于读取的实际操作，因为不同的使用场景（读取文件，读取网络内容）而不同，所以它并没有提供_read方法的具体实现
 
-这个_read方法，其实是有使用场景（读取文件，读取网络内容）来指定的；也即是说/lib/internal/fs/stream.js这个使用场景，必须提供_read方法。
+不同的使用场景（读取文件，读取网络内容），读取方法_read肯定不一样。所以要根据使用场景来具体提供。
+
+* 文件读取场景，/lib/internal/fs/stream.js，有自己的_read方法；
+* 网路读取，/lib/_http_incoming.js, 也有自己的_read方法。
 
 查看/lib/internal/fs/stream.js，确实存在一个_read方法，我们看下它的实现：
 
@@ -932,7 +943,7 @@ ReadStream.prototype._read = function(n) {
 * 调用this[kFs].read,读取文件；（这里的this[kFs]，就是/lib/fs.js模块；即调用fs的read方法）
 * 读取到内容后，读取到内容后，执行push操作
 
->提示：
+>注：this[kFs]的由来
 >```js
 >// 文件位置：/li/internal/fs/stream.js
 >...
@@ -959,6 +970,38 @@ ReadStream.prototype._read = function(n) {
 
 那么push方法是什么呢？我们看下它的实现
 
+#### 3.3 push方法
+
+push方法的作用就是把读取到的内容推送出去。
+> push方法有两种推送方式，一种是直接触发data事件，把内容推给消费方；
+> 还有一种方式是先推送到stream的_readableState中保存起来，供消费方需要的时候来读取。
+> 我们这里的应用场景是第一种（至于为什么是第一种，将在下一章节‘nodejs流’中详细展开）
+
+push方法调用了readableAddChunk，然后调用addChunk，最终触发data事件：stream.emit('data', chunk);
+```js
+// 文件位置：/lib/_stream_readable.js
+Readable.prototype.push = function(chunk, encoding) {
+  return readableAddChunk(this, chunk, encoding, false);
+};
+
+function readableAddChunk(stream, chunk, encoding, addToFront) {
+  ...
+        addChunk(stream, state, chunk, false);
+  ...
+}
+
+function addChunk(stream, state, chunk, addToFront) {
+  if (state.flowing && state.length === 0 && !state.sync) {
+    ...
+    stream.emit('data', chunk);
+  } else {
+    ...
+  }
+  maybeReadMore(stream, state);
+}
+```
+
+到此为止，data事件触发后，便被.on('data', cb)捕获，执行回调cb。
 
 
 
