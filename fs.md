@@ -738,7 +738,7 @@ ObjectSetPrototypeOf(ReadStream, Readable);
 
 可见，ReadStream 类，其实就是继承了Readable。
 
-Readable是什么呢？它是基础Stream的一个可读流类（构造函数）
+Readable是基础Stream的一个可读流类（构造函数）
 
 ```js
 const { Readable, Writable, finished } = require('stream');
@@ -823,8 +823,8 @@ readerStream.on('data', function(chunk) {
 于是文件内容源源不断地累加到变量data中。
 
 这里有些用户会有疑问：
-* 底层是怎么不停歇地读取文件呢？
 * 读取一次后，是怎么触发data事件的？
+* 底层是怎么不停歇地读取文件呢？
 
 要回答这个问题，我们就要进一步，看下.on到底感受啥。
 
@@ -849,7 +849,7 @@ Readable.prototype.on = function(ev, fn) {
 * 调用events的.on,监听data事件
 * 还调用了this.resume()方法，这个方法就是启动流的读取工作。
 
-resume是一连串的调用，核心就是触发一个循环，不断调用操作系统的读取接口，进行读取。
+resume是一连串的调用:
 
 ```js
 Readable.prototype.resume = function() {
@@ -865,21 +865,35 @@ function resume(stream, state) {
 }
 
 function resume_(stream, state) {
-  ...
+  debug('resume', state.reading);
+  if (!state.reading) {
+    stream.read(0);
+  }
+
+  state.resumeScheduled = false;
+  stream.emit('resume');
   flow(stream);
-  ...
+  if (state.flowing && !state.reading)
+    stream.read(0);
 }
 
-function flow(stream) {
-  ...
-  while (state.flowing && stream.read() !== null);
-}
 ```
 > 注：我们忽略了很多判断代码，主要讲解核心流程。详细代码解读，请移步下一章节“nodejs流”。
 
-可以看到，这里flow执行了一个while循环，调用stream.read方法。
+可以看到，on('data'）后，最终来到了resume_这里；在解读resume_之前，我们先说明一个知识点：state.reading:
+* state.reading的含义，是指“操作系统是否正在进行文件读取”这个动作
+* 无论是同步，还是异步，只要操作系统在读，这个属性就是true；否则为false。
 
-具体到文件流，这个read方法是什么呢？
+继续解读resume_代码：
+```js
+// resume_代码片段解读
+// 由于我们刚刚创建的stream实例，还没有开始读取动作，所以这里是false，因此开始调用stream.read(0)
+if (!state.reading) {
+    stream.read(0);
+  }
+```
+
+这个read方法是什么呢？
 
 #### 3.2 read和_read
 由于fs.createReadStream是返回/lib/internal/fs/stream.js中ReadStream实例,因此这里this.read就是ReadStream的原型链上的方法read。
@@ -1001,9 +1015,58 @@ function addChunk(stream, state, chunk, addToFront) {
 }
 ```
 
-到此为止，data事件触发后，便被.on('data', cb)捕获，执行回调cb。
+data事件触发后，便被.on('data', cb)捕获，执行回调cb。
 
+之前设置的两个问题：
+* 读取一次后，是怎么触发data事件的？
+* 底层是怎么不停歇地读取文件呢？
 
+到此为止，其中第一个便得到了答案。我们来看第二个问题。
+
+#### 3.4 maybeReadMore
+
+细心的读者应该已经发现，在上面代码addChunk中，除了触发data事件外，外额外调用了一个函数：maybeReadMore。
+
+这个函数的作用就是：在一次成功读取完成后，尝试再进行下一次读取，以便源源不断地把整个文件读取完。
+
+我们看下它的代码
+```js
+// 文件位置：/lib/_stream_readable.js
+function maybeReadMore(stream, state) {
+  if (!state.readingMore) {
+    state.readingMore = true;
+    process.nextTick(maybeReadMore_, stream, state);
+  }
+}
+
+function maybeReadMore_(stream, state) {
+  while (!state.reading && !state.ended &&
+         (state.length < state.highWaterMark ||
+          (state.flowing && state.length === 0))) {
+    const len = state.length;
+    debug('maybeReadMore read 0');
+    stream.read(0);
+    if (len === state.length)
+      // Didn't get any data, stop spinning.
+      break;
+  }
+  state.readingMore = false;
+}
+```
+
+maybeReadMore调用了maybeReadMore_, 它通过判断以下条件来决定是否继续读：
+* 操作系统此时没有“正在读”文件 --!state.reading
+* 文件流没有街商户 --!state.ended
+* 当前文件流的buffer还没满
+
+对应到我们的例子，由于前一次读取完成后，直接把数据emit出去了，所以此时的状态是：
+* 没有在读
+* 文件还没结束
+* buffer的数据长度为0
+
+因此，我们将继续调用stream.read(0)来进行读取。
+
+>程序将不断重复stream.read(0)--> push-->addChunk-->emit-->maybeReadMore-->stream.read(0)，z直到将文件读取完成
 
 
 
