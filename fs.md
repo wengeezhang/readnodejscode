@@ -914,6 +914,17 @@ Readable.prototype._read = function(n) {
   throw new ERR_METHOD_NOT_IMPLEMENTED('_read()');
 };
 ```
+> read源码的功能点(388-518)
+> * 判断n (388-401)
+> * n非0时，emittedReadable设置为false(403-404)
+> * 如果n为0，且buffer中数据已满，且有needReadable，则直接emit readable,结束(406-421)
+> * 再次计算n，如果为0且ended，触发endReadable(425-430)
+> * 判断是否需要doRead  （没有在读取中，且还没有达到highWaterMark）（455-470）
+> * 需要执行读取操作。如果state当前为0（一点也没有，则需要设置needReadable;如果有一点，则不用）（475-476）
+> * 执行读取操作（478）
+> * 获取当前buffer中有的数据，给到ret（486-490）
+> * emit data事件
+
 
 从上面代码看出，Readable的read方法，调用了_read。
 
@@ -1066,119 +1077,8 @@ maybeReadMore调用了maybeReadMore_, 它通过判断以下条件来决定是否
 
 因此，我们将继续调用stream.read(0)来进行读取。
 
->程序将不断重复stream.read(0)--> push-->addChunk-->emit-->maybeReadMore-->stream.read(0)，z直到将文件读取完成
+到此为止，第二个问题的答案便出来了：程序将不断重复stream.read(0)--> push-->addChunk-->emit-->maybeReadMore-->stream.read(0)，直到将文件读取完成
 
-
-
-
-
-
-
-
-1.readFile会调用read,read:
-```js
-const req = new FSReqCallback();
-  req.oncomplete = wrapper;
-
-  binding.read(fd, buffer, offset, length, position, req);
-```
-这里封装了一个FSReqCallback对象req，传到binding.read
-
-2.如果是readFileSync会调用readSync，readSync:
-```js
-const result = binding.read(fd, buffer, offset, length, position,
-                              undefined, ctx);
-```
-这里传递了一个undefined。
-
-3.如果是promise形式
-```js
-lib/internal/fs/promises.js
-const bytesRead = (await binding.read(handle.fd, buffer, offset, length,
-                                        position, kUsePromises)) || 0;
-```
-这里传递了一个kUsePromises
-
-针对1和3，c++中统一封装为：req_wrap_async
-
-```c++
-FSReqBase* req_wrap_async = GetReqWrap(args, 5);
-  if (req_wrap_async != nullptr) {  // read(fd, buffer, offset, len, pos, req)
-    AsyncCall(env, req_wrap_async, args, "read", UTF8, AfterInteger,
-              uv_fs_read, fd, &uvbuf, 1, pos);
-  }
-
-
-FSReqBase* GetReqWrap(const v8::FunctionCallbackInfo<v8::Value>& args,
-                      int index,
-                      bool use_bigint) {
-  v8::Local<v8::Value> value = args[index];
-  // 如果是普通对象，则直接返回FSReqBase
-  if (value->IsObject()) {
-    return Unwrap<FSReqBase>(value.As<v8::Object>());
-  }
-
-  BindingData* binding_data = Unwrap<BindingData>(args.Data());
-  Environment* env = binding_data->env();
-  // 如果是promise,则返回一个FSReqPromise
-  if (value->StrictEquals(env->fs_use_promises_symbol())) {
-    if (use_bigint) {
-      return FSReqPromise<AliasedBigUint64Array>::New(binding_data, use_bigint);
-    } else {
-      return FSReqPromise<AliasedFloat64Array>::New(binding_data, use_bigint);
-    }
-  }
-  return nullptr;
-}
-```
-
-
-
-
-
-
-
-
-```js
-function addChunk(stream, state, chunk, addToFront) {
-  if (state.flowing && state.length === 0 && !state.sync) {
-    ...
-    stream.emit('data', chunk);
-  } else {
-    ...
-  }
-  maybeReadMore(stream, state);
-}
-
-function maybeReadMore(stream, state) {
-  if (!state.readingMore) {
-    state.readingMore = true;
-    process.nextTick(maybeReadMore_, stream, state);
-  }
-}
-
-function maybeReadMore_(stream, state) {
-  ...
-  while (!state.reading && !state.ended &&
-         (state.length < state.highWaterMark ||
-          (state.flowing && state.length === 0))) {
-    const len = state.length;
-    debug('maybeReadMore read 0');
-    stream.read(0);
-    if (len === state.length)
-      // Didn't get any data, stop spinning.
-      break;
-  }
-  state.readingMore = false;
-}
-```
-> 小结：
-> fs通过 createReadStream 创建流，然后注册一个on('data')，调用resume，触发flow模式
-> flow会无限循环调用read()（其实这里不会无限调用，只调用了一次）。read会调用fs提供的_read方法。
-> lib/internal/fs/stream的_read方法通过调用this[kFs].read(),并在cb中，将读取到的数据，调用stream.push()
-> stream.push就比较经典了，调用addChunk将数据emit data出去。
-> addChunk最后会调用一个 maybeReadMore 再次读取。（这里解决flow中无限循环read只执行一次，以实现源源不断地读取数据，进行流）
-> maybeReadMore 通过read(0)来再次调用_read方法，来继续读取数据。
 # 四.总结：
 
 
