@@ -914,16 +914,6 @@ Readable.prototype._read = function(n) {
   throw new ERR_METHOD_NOT_IMPLEMENTED('_read()');
 };
 ```
-> read源码的功能点(388-518)
-> * 判断n (388-401)
-> * n非0时，emittedReadable设置为false(403-404)
-> * 如果n为0，且buffer中数据已满，且有needReadable，则直接emit readable,结束(406-421)
-> * 再次计算n，如果为0且ended，触发endReadable(425-430)
-> * 判断是否需要doRead  （没有在读取中，且还没有达到highWaterMark）（455-470）
-> * 需要执行读取操作。如果state当前为0（一点也没有，则需要设置needReadable;如果有一点，则不用）（475-476）
-> * 执行读取操作（478）
-> * 获取当前buffer中有的数据，给到ret（486-490）
-> * emit data事件
 
 
 从上面代码看出，Readable的read方法，调用了_read。
