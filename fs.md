@@ -690,8 +690,9 @@ readerStream.on('data', function(chunk) {
 });
 ```
 
-从样例中，我们看到，这里创建一个可读流，然后对其监听data事件就可以消费了。
-我们看下createReadStream的实现。
+从上面样例中，我们看到，这里创建一个可读流，然后对其监听data事件就可以消费了。
+
+我们先看createReadStream的实现：
 
 ```js
 // 文件位置：/lib/fs.js
@@ -714,7 +715,6 @@ function lazyLoadStreams() {
 所以，fs.createReadStream本质就是创建一个ReadStream（/lib/internal/fs/streams.js）的实例。
 
 ### 2.ReadStream
-ReadStream是对基类Stream的Readable进行了封装，我们看下它的实现
 
 > 关于流Stream的详细运作原理和使用解读，将在下一章节“nodejs流”展开。本章主要介绍fs模块封装的流。
 
@@ -801,15 +801,16 @@ function Readable(options) {
 到此为止，我们发现fs.createReadStream做完了两件事：
 
 * 初始化一个Readable实例，并返回
-* 继承events，让Readable实例具备.on .emit等方法
+* 继承events的功能，让Readable实例具备.on .emit等方法
 
-接下里就是对Readable实例做处理
+到此为止，初始化工作完成。此时我们是基于Stream的Readable扩展了一个子类ReadStream。整体结构图如下：
+
+![基类和子类结构图](./img_unit/unit/unit.060.png)
 
 ### 3.消费可读流
 
-有了.on方法，我们便可以监听消费Readable实例：
+先看下样例，是怎么消费Readable的：
 
-#### 3.1 .on
 ```js
 // 样例
 let data = ``;
@@ -818,15 +819,23 @@ readerStream.on('data', function(chunk) {
    data += chunk;
 });
 ```
+
 当操作系统底层完成文件读取后，变化触发一个"data"事件，被这里捕获，执行回调。
 
 于是文件内容源源不断地累加到变量data中。
 
 这里有些用户会有疑问：
-* 读取一次后，是怎么触发data事件的？
+* 底层系统读取一次后，是怎么触发data事件的？
 * 底层是怎么不停歇地读取文件呢？
 
-要回答这个问题，我们就要进一步，看下.on到底感受啥。
+要回答这个问题，我们分两步，先给出on('data')的整体流程图，再进行代码解读。
+
+![on('data')流程图](./img_unit/unit/unit.061.png)
+
+
+然后我们对照流程图和源码进行解读。
+
+#### 3.1 .on
 
 ```js
 Readable.prototype.on = function(ev, fn) {
@@ -1071,6 +1080,11 @@ maybeReadMore调用了maybeReadMore_, 它通过判断以下条件来决定是否
 
 # 四.总结：
 
+本章节我们解读了文件操作的三种常用方式：
+* 同步
+* 异步
+* 流方式
 
+同步方式的使用场景有限，普通开发需求，使用异步方式即可满足。特殊场景（大文件）下可能会涉及到流方式。
 
-
+异步和流方式，都牵扯到线程池。线程池的存在，确保了nodejs可以以非阻塞的方式来响应用户的请求。
