@@ -108,6 +108,40 @@ nodejs创建一个流后，无非两种使用方式：
 > 所以我们这里只解读 strem.on('data',cb), stream('readable',cb)这两种方式。
 # 三. nodejs源码解读
 
+流可分为四种类型，分别为：可读流，可写流，双向流，转换流。所有这些，都被定义在nodejs的/lib/stream.js中。
+
+```js
+// 文件位置：/lib/stream.js
+const pipeline = require('internal/streams/pipeline');
+const eos = require('internal/streams/end-of-stream');
+const internalBuffer = require('internal/buffer');
+
+// Note: export Stream before Readable/Writable/Duplex/...
+// to avoid a cross-reference(require) issues
+const Stream = module.exports = require('internal/streams/legacy');
+
+Stream.Readable = require('_stream_readable');
+Stream.Writable = require('_stream_writable');
+Stream.Duplex = require('_stream_duplex');
+Stream.Transform = require('_stream_transform');
+Stream.PassThrough = require('_stream_passthrough');
+
+Stream.pipeline = pipeline;
+Stream.finished = eos;
+
+// Backwards-compat with node 0.4.x
+Stream.Stream = Stream;
+
+Stream._isUint8Array = require('internal/util/types').isUint8Array;
+Stream._uint8ArrayToBuffer = function _uint8ArrayToBuffer(chunk) {
+  return new internalBuffer.FastBuffer(chunk.buffer,
+                                       chunk.byteOffset,
+                                       chunk.byteLength);
+};
+```
+
+代码比较简单，我们做个总结：
+* 
 ## 使用场景
 
 ## 使用模式（流动或手工）
