@@ -47,7 +47,7 @@
 
 * 顾客把要采购的东西告诉“客户管理机器人”
 * “客户管理机器人”把采购信息，交给“采购信息管理中心”来进行简单处理，输出标准的“远程采购单”
-* “采购信息管理中心”把“远程采购单”移交给“车队管理中心”，车队拿到标准的“远程采购单”，就知道去哪取货了。
+* “采购信息管理中心”把“远程采购单”移交给“车队管理中心”；“车队管理中心”派出一辆车，根据标准的“远程采购单”，就知道去哪取货了。
 
 整个流程如下：
 
@@ -78,6 +78,7 @@
 * 采购信息管理中心 --> http.ClientRequest(即/lib/_http_client.js中的ClientRequest)
 * 远程采购单 --> req（即http.ClientRequest实例）
 * 车队管理中心 --> http.Agent(即/lib/_http_agent.js中的Agent)
+* 车 --> 即socket（也就是connection，对应/lib/net.js中的Socket实例）
 
 # 三. nodejs源码解读
 ## 1. 解读入口
@@ -126,8 +127,17 @@ function request(url, options, cb) {
 从上面代码看出，http.request本质就是创建一个ClientRequest实例，我们看下它的代码。
 
 > 由于ClientRequest太长，有136行，所以我们逐块分析
+### 2.1 初始化实例req
+第一步：准备“远程采购单”。
 
-### 2.1 准备agent
+即通过创建一个实例req：new ClientRequest(url, options, cb)，来保存用户请求的各类信息。
+
+这个req，就是故事场景中的“远程采购单”；
+### 2.2 准备agent
+第二步：准备一个车队备用。
+
+即准备一个agent。
+
 ```js
 // 文件地址：/lib/_http_client.js
 function ClientRequest(input, options, cb) {
@@ -166,7 +176,9 @@ module.exports = {
 ```
 可以看出，这里的globalAgent，就是进程启动时，初始化好的一个Agent实例。
 
-### 2.2 
+### 2.3 
+第三步：派车，根据“远程采购单”去执行任务。
+
 ```js
 // 文件地址：/lib/_http_client.js
 function ClientRequest(input, options, cb) {
@@ -199,4 +211,82 @@ function ClientRequest(input, options, cb) {
     }
   }
 }
+```
+上面的代码可以看出，如何派车，有两个选择：
+* 如果有agent（车队），则把请求交给agent来处理（由车队派车去采购）
+* 如果没有agent（车队），但是有指定的个性化的车（options.createConnection），则使用之；
+  * 如果没有agent（车队），也没有指定的个性化的车（没有options.createConnection），则使用nodejs自带的net.createConnection（不归属任何车队的独立车辆）
+
+> 无论是options.createConnection，还是net.createConnection，他们的底层实现，都是创建一个Socket实例（/lib/net.js中的Socket），来调用底层的tcp handle（以tcp使用场景为例），发起connect。
+
+我们先看第一个选择：使用agent(通过车队处理请求)
+
+#### 2.3.1 通过agent发送请求
+
+就是上节代码中的
+```js
+// 文件地址：/lib/_http_client.js
+if (this.agent) {
+  this.agent.addRequest(this, options);
+}
+```
+我们来看下，this.agent是如何通过addRequest处理请求的。
+
+不过，在这之前，我们先来看下agent的庐山真面目。
+
+##### 先认识agent
+```js
+// 文件地址：/lib/_http_agent.js
+function Agent(options) {
+  if (!(this instanceof Agent))
+    return new Agent(options);
+
+  EventEmitter.call(this);
+
+  this.defaultPort = 80;
+  this.protocol = 'http:';
+
+  this.options = { ...options };
+
+  // Don't confuse net and make it think that we're connecting to a pipe
+  this.options.path = null;
+  this.requests = {};
+  this.sockets = {};
+  this.freeSockets = {};
+  this.keepAliveMsecs = this.options.keepAliveMsecs || 1000;
+  this.keepAlive = this.options.keepAlive || false;
+  this.maxSockets = this.options.maxSockets || Agent.defaultMaxSockets;
+  this.maxFreeSockets = this.options.maxFreeSockets || 256;
+
+  this.on('free', (socket, options) => {
+    ...// 稍后展开介绍
+  });
+
+  // Don't emit keylog events unless there is a listener for them.
+  this.on('newListener', maybeEnableKeylog);
+}
+```
+
+可以看出，agent本身属性比较简单，其中有三个核心的队列（说数组更合适）：
+* requests：当前还未发出去的req。（其实叫pendingRequests更合适，^_^）
+  * 即【还未分配车辆，处于积压状态】的“远程采购单”
+* sockets：当前正在处理请求的socket。（其实叫inUseSockets更合适, ^_^）
+  * 即已经分配了“远程采购单”，正在执行任务的车辆
+* freeSockets：空闲的socket。
+  * 即车队中空闲的车辆
+
+> 细心的读者会发现，this.requests， this.sockets， this.freeSockets都不是数组，而是一个对象。
+> 为什么是对象呢？因为agent要管理很多不同目标站点的请求，所以采用key:array的方式来管理
+> 比如requests:
+> {"qq.com": [req1, req2], "baidu.com": [req3, reqN]}
+> 注意：这里的key会比较负责，可能包含更多信息（参见/lib/_http_agent.js中的Agent.prototype.getName方法），这里只是简单写成“qq.com”
+
+Agent除了初始化上面提到的属性，还做了两个事件监听：
+* this.on('free', cb)
+* this.on('newListener', cb)
+
+我们重点看下this.on('free', cb): 监听
+##### agent发送请求
+
+#### 2.3.2 通过指定车辆直接发送请求
 # 四.总结
