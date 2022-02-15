@@ -276,16 +276,93 @@ function Agent(options) {
   * 即车队中空闲的车辆
 
 > 细心的读者会发现，this.requests， this.sockets， this.freeSockets都不是数组，而是一个对象。
-> 为什么是对象呢？因为agent要管理很多不同目标站点的请求，所以采用key:array的方式来管理
+> 为什么是对象呢？因为agent要管理很多不同目标站点的请求，所以采用{domain:[]}的方式来管理
 > 比如requests:
-> {"qq.com": [req1, req2], "baidu.com": [req3, reqN]}
-> 注意：这里的key会比较负责，可能包含更多信息（参见/lib/_http_agent.js中的Agent.prototype.getName方法），这里只是简单写成“qq.com”
+> this.requests = {"qq.com": [req1, req2], "baidu.com": [req3, reqN]}
+>
+> 注意：这里完整的key是“qq.com:80::4”（参见/lib/_http_agent.js中的Agent.prototype.getName方法），这里只是简单写成“qq.com”
+
 
 Agent除了初始化上面提到的属性，还做了两个事件监听：
 * this.on('free', cb)
 * this.on('newListener', cb)
 
-我们重点看下this.on('free', cb): 监听
+我们重点看下this.on('free', cb): agent管理的socket有空闲时，触发这里的回调cb。
+
+>备注： 
+>通过agent创建socket时，创建完成后，一般会执行 installListeners:
+installListeners里面，有一段代码：
+>```js
+>function onFree() {
+>    debug('CLIENT socket onFree');
+>    agent.emit('free', s, options);
+>  }
+>  s.on('free', onFree);
+>```
+会对创建好的socket(即下面代码中的s)监听free事件。
+等socket空闲时（参见_http_client.js中的responseKeepAlive），会触发onFree，onFree会接着触发agent.emit('free', s, options);
+最终触发this.on('free', cb)
+
+>在这里会agent.emit('free', s, options);
+
+
+```js
+// 文件地址：/lib/_http_agent.js
+this.on('free', (socket, options) => {
+    const name = this.getName(options);
+    debug('agent.on(free)', name);
+
+    // TODO(ronag): socket.destroy(err) might have been called
+    // before coming here and have an 'error' scheduled. In the
+    // case of socket.destroy() below this 'error' has no handler
+    // and could cause unhandled exception.
+
+    if (!socket.writable) {
+      socket.destroy();
+      return;
+    }
+
+    const requests = this.requests[name];
+    if (requests && requests.length) {
+      const req = requests.shift();
+      setRequestSocket(this, req, socket);
+      if (requests.length === 0) {
+        delete this.requests[name];
+      }
+      return;
+    }
+
+    // If there are no pending requests, then put it in
+    // the freeSockets pool, but only if we're allowed to do so.
+    const req = socket._httpMessage;
+    if (!req || !req.shouldKeepAlive || !this.keepAlive) {
+      socket.destroy();
+      return;
+    }
+
+    let freeSockets = this.freeSockets[name];
+    const freeLen = freeSockets ? freeSockets.length : 0;
+    let count = freeLen;
+    if (this.sockets[name])
+      count += this.sockets[name].length;
+
+    if (count > this.maxSockets ||
+        freeLen >= this.maxFreeSockets ||
+        !this.keepSocketAlive(socket)) {
+      socket.destroy();
+      return;
+    }
+
+    freeSockets = freeSockets || [];
+    this.freeSockets[name] = freeSockets;
+    socket[async_id_symbol] = -1;
+    socket._httpMessage = null;
+    this.removeSocket(socket, options);
+
+    socket.once('error', freeSocketErrorListener);
+    freeSockets.push(socket);
+  });
+```
 ##### agent发送请求
 
 #### 2.3.2 通过指定车辆直接发送请求
