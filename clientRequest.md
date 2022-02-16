@@ -78,13 +78,14 @@
 * 采购信息管理中心 --> http.ClientRequest(即/lib/_http_client.js中的ClientRequest)
 * 远程采购单 --> req（即http.ClientRequest实例）
 * 车队管理中心 --> http.Agent(即/lib/_http_agent.js中的Agent)
-* 车 --> 即socket（也就是connection，对应/lib/net.js中的Socket实例）
+* 车(司机) --> 即socket（也就是connection，对应/lib/net.js中的Socket实例）
 
 # 三. nodejs源码解读
 ## 1. 解读入口
 我们先看官方的使用样例
 ```js
 // usage example
+// 参见 https://nodejs.org/dist/latest-v17.x/docs/api/http.html#httprequesturl-options-callback
 const http = require('http');
 
 const postData = JSON.stringify({
@@ -156,7 +157,7 @@ function ClientRequest(input, options, cb) {
     // Explicitly pass through this statement as agent will not be used
     // when createConnection is provided.
   }
-  this.agent = agent;
+  this.agent = agent; // 到此，agent准备完毕
   ...
 }
 ```
@@ -213,9 +214,10 @@ function ClientRequest(input, options, cb) {
 }
 ```
 上面的代码可以看出，如何派车，有两个选择：
-* 如果有agent（车队），则把请求交给agent来处理（由车队派车去采购）
-* 如果没有agent（车队），但是有指定的个性化的车（options.createConnection），则使用之；
-  * 如果没有agent（车队），也没有指定的个性化的车（没有options.createConnection），则使用nodejs自带的net.createConnection（不归属任何车队的独立车辆）
+* 如果有agent（车队），则把请求交给agent来处理（由车队派车去处理，其他啥也不用管）
+* 如果没有agent（车队）：
+  * 如果有指定的个性化的车（options.createConnection），则使用之；
+  * 如果没有指定的个性化的车（没有options.createConnection），则使用nodejs自带的net.createConnection（不归属任何车队的独立车辆）
 
 > 无论是options.createConnection，还是net.createConnection，他们的底层实现，都是创建一个Socket实例（/lib/net.js中的Socket），来调用底层的tcp handle（以tcp使用场景为例），发起connect。
 
@@ -267,10 +269,10 @@ function Agent(options) {
 }
 ```
 
-可以看出，agent本身属性比较简单，其中有三个核心的队列（说数组更合适）：
-* requests：当前还未发出去的req。（其实叫pendingRequests更合适，^_^）
-  * 即【还未分配车辆，处于积压状态】的“远程采购单”
-* sockets：当前正在处理请求的socket。（其实叫inUseSockets更合适, ^_^）
+可以看出，agent自身属性比较简单，其中有三个核心的队列（说数组更合适）：
+* requests：当前还未发出去的req。（其实叫pendingRequests更合适）
+  * 即【处于积压状态，还未分配车辆】的“远程采购单”
+* sockets：当前正在处理请求的socket。（其实叫inUsingSockets更合适）
   * 即已经分配了“远程采购单”，正在执行任务的车辆
 * freeSockets：空闲的socket。
   * 即车队中空闲的车辆
@@ -280,17 +282,18 @@ function Agent(options) {
 > 比如requests:
 > this.requests = {"qq.com": [req1, req2], "baidu.com": [req3, reqN]}
 >
-> 注意：这里完整的key是“qq.com:80::4”（参见/lib/_http_agent.js中的Agent.prototype.getName方法），这里只是简单写成“qq.com”
+> 注意：key代表了目标站点，包含的信息很多，比如“qq.com:80::4”（参见/lib/_http_agent.js中的Agent.prototype.getName方法），这里只是简单写成“qq.com”
 
 
 Agent除了初始化上面提到的属性，还做了两个事件监听：
 * this.on('free', cb)
 * this.on('newListener', cb)
 
-我们重点看下this.on('free', cb): agent管理的socket有空闲时，触发这里的回调cb。
+我们重点看下this.on('free', cb)，它的作用是：
+监听一个free事件；当agent管理的socket有空闲时，触发这里的回调cb。
 
 >备注： 
->通过agent创建socket时，创建完成后，一般会执行 installListeners:
+>通过agent创建socket时（有不通过agent创建的socket，后续再展开），socket创建完成后，一般会执行 installListeners。
 installListeners里面，有一段代码：
 >```js
 >function onFree() {
@@ -299,13 +302,85 @@ installListeners里面，有一段代码：
 >  }
 >  s.on('free', onFree);
 >```
-会对创建好的socket(即下面代码中的s)监听free事件。
-等socket空闲时（参见_http_client.js中的responseKeepAlive），会触发onFree，onFree会接着触发agent.emit('free', s, options);
-最终触发this.on('free', cb)
+>会对创建好的socket(即下面代码中的s)监听free事件。
+后续的流程是：
+> * 等socket空闲时（参见_http_client.js中的responseKeepAlive），会触发onFree;
+> * onFree会接着触发agent.emit('free', s, options);
+> * 由于agent监听过free，this.on('free', cb)，所以cb被执行
 
->在这里会agent.emit('free', s, options);
+我们先剧透下cb的逻辑：当有socket空闲出来时
+* 检测是否有pending状态的请求，如果有，则直接使用这个空闲出来的socket发送出去
+* 如果没有pending状态的请求，则放到freeSockets中待用（前提是可复用）
+  * 是否可复用，是socket上一个req的属性，而非socket自身（读者可以忽略这一点）
+
+详细代码逻辑，我们先不展开；先看下，有了agent，怎么使用agent发出请求。
 
 
+##### agent发送请求
+通过agent发送请求，其实就是通过把req添加到agent中，交给它管理。
+即this.agent.addRequest(this, options);
+
+```js
+// 文件地址：/lib/_http_agent.js
+Agent.prototype.addRequest = function addRequest(req, options, port, localAddress) {
+  ...// 处理options
+  const name = this.getName(options);
+  if (!this.sockets[name]) {
+    this.sockets[name] = [];
+  }
+
+  // 1.先看有没有空闲的socket
+  const freeSockets = this.freeSockets[name];
+  let socket;
+  if (freeSockets) {
+    while (freeSockets.length && freeSockets[0].destroyed) {
+      freeSockets.shift();
+    }
+    socket = freeSockets.shift();
+    if (!freeSockets.length)
+      delete this.freeSockets[name];
+  }
+
+  const freeLen = freeSockets ? freeSockets.length : 0;
+  const sockLen = freeLen + this.sockets[name].length;
+  // 2.如果有空闲的socket，则把socket分配给req（setRequestSocket）去执行任务
+  if (socket) {
+    // Guard against an uninitialized or user supplied Socket.
+    const handle = socket._handle;
+    if (handle && typeof handle.asyncReset === 'function') {
+      // Assign the handle a new asyncId and run any destroy()/init() hooks.
+      handle.asyncReset(new ReusedHandle(handle.getProviderType(), handle));
+      socket[async_id_symbol] = handle.getAsyncId();
+    }
+
+    this.reuseSocket(socket, req);
+    setRequestSocket(this, req, socket);
+    this.sockets[name].push(socket);
+  } else if (sockLen < this.maxSockets) {
+    // 3. 如果没有空闲的，且可以创建，则临时创建一个
+    debug('call onSocket', sockLen, freeLen);
+    // If we are under maxSockets create a new one.
+    this.createSocket(req, options, handleSocketCreation(this, req, true));
+  } else {
+    debug('wait for socket');
+    // 4. 如果没有空闲的，且不能再创建，则先挤压起来
+    // We are over limit so we'll add it to the queue.
+    if (!this.requests[name]) {
+      this.requests[name] = [];
+    }
+    this.requests[name].push(req);
+  }
+};
+```
+从上面代码可以看出，addRequest的作用为：
+* 如果有空闲的socket，则取出一个分配给req（setRequestSocket），去执行任务
+* 如果没有空闲的socket，并且可以创建（sockLen < this.maxSockets），则临时创建一个socket，分配给req，去执行任务
+* 如果没有空闲的socket，并且不可以创建，则把找个req挤压起来this.requests[name].push(req);
+> 此处的name就是目标站点，比如”qq.com“。
+
+
+
+##### agent发送请求后，socket回收
 ```js
 // 文件地址：/lib/_http_agent.js
 this.on('free', (socket, options) => {
@@ -363,7 +438,7 @@ this.on('free', (socket, options) => {
     freeSockets.push(socket);
   });
 ```
-##### agent发送请求
 
 #### 2.3.2 通过指定车辆直接发送请求
+
 # 四.总结
