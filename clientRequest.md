@@ -313,11 +313,11 @@ installListeners里面，有一段代码：
 * 如果没有pending状态的请求，则放到freeSockets中待用（前提是可复用）
   * 是否可复用，是socket上一个req的属性，而非socket自身（读者可以忽略这一点）
 
-详细代码逻辑，我们先不展开；先看下，有了agent，怎么使用agent发出请求。
+详细代码逻辑先不展开；先看下有了agent，怎么使用它发出请求。
 
 
 ##### agent发送请求
-通过agent发送请求，其实就是通过把req添加到agent中，交给它管理。
+通过agent发送请求，其实就是通过把req添加到agent中来管理。
 即this.agent.addRequest(this, options);
 
 ```js
@@ -375,8 +375,118 @@ Agent.prototype.addRequest = function addRequest(req, options, port, localAddres
 从上面代码可以看出，addRequest的作用为：
 * 如果有空闲的socket，则取出一个分配给req（setRequestSocket），去执行任务
 * 如果没有空闲的socket，并且可以创建（sockLen < this.maxSockets），则临时创建一个socket，分配给req，去执行任务
-* 如果没有空闲的socket，并且不可以创建，则把找个req挤压起来this.requests[name].push(req);
-> 此处的name就是目标站点，比如”qq.com“。
+* 如果没有空闲的socket，并且不可以创建，则把找个req挤压起来（this.requests[name].push(req)）;
+> 注：此处的name就是目标站点，比如”qq.com“。
+
+我们先看第一种情况，当有空闲的socket时，执行setRequestSocket。
+再看第二种情况，临时创建socket后，执行回调。回调函数为handleSocketCreation。我们看这个函数的逻辑：
+```js
+// 文件地址：/lib/_http_agent.js
+function handleSocketCreation(agent, request, informRequest) {
+  return function handleSocketCreation_Inner(err, socket) {
+    if (err) {
+      process.nextTick(emitErrorNT, request, err);
+      return;
+    }
+    // 如果有req需要处理，则调用setRequestSocket。否则触发free，表明有空闲的socket。
+    if (informRequest)
+      setRequestSocket(agent, request, socket);
+    else
+      socket.emit('free');
+  };
+}
+```
+
+可以看出，这里也是调用了 setRequestSocket。
+
+总结：
+this.agent.addRequest(request)，其实就是找到一个socket（有空闲的直接使用，没有空闲的临时创建）；
+最后调用 setRequestSocket(agent, request, socket);
+
+接下来我们看setRequestSocket的逻辑。
+
+```js
+// 文件地址：/lib/_http_agent.js
+function setRequestSocket(agent, req, socket) {
+  req.onSocket(socket);
+  const agentTimeout = agent.options.timeout || 0;
+  if (req.timeout === undefined || req.timeout === agentTimeout) {
+    return;
+  }
+  socket.setTimeout(req.timeout);
+}
+```
+
+可以看出，这里调用了req.onSocket(socket); req就是request，即ClientRequest实例。我们看下它的逻辑。
+
+```js
+// 文件地址：/lib/_http_client.js
+ClientRequest.prototype.onSocket = function onSocket(socket) {
+  // TODO(ronag): Between here and onSocketNT the socket
+  // has no 'error' handler.
+  process.nextTick(onSocketNT, this, socket);
+};
+
+function onSocketNT(req, socket) {
+  if (req.destroyed) {
+    _destroy(req, socket, req[kError]);
+  } else {
+    tickOnSocket(req, socket);
+  }
+}
+```
+
+可以看出，req.onSocket本质就是tickOnSocket(req, socket);我们继续看它的逻辑。
+
+```js
+// 文件地址：/lib/_http_client.js
+function tickOnSocket(req, socket) {
+  // 分配一个解析器parser给到req，用于数据解析。
+  // 详细原理参见 ”nodejs如何处理高并发请求“一章中的【2.4.2 触发回调，设置解析器】
+  const parser = parsers.alloc();
+  req.socket = socket;
+  parser.initialize(HTTPParser.RESPONSE,
+                    new HTTPClientAsyncResource('HTTPINCOMINGMESSAGE', req),
+                    req.maxHeaderSize || 0,
+                    req.insecureHTTPParser === undefined ?
+                      isLenient() : req.insecureHTTPParser,
+                    0);
+  parser.socket = socket;
+  parser.outgoing = req;
+  req.parser = parser;
+
+  socket.parser = parser;
+  socket._httpMessage = req;
+
+  // Propagate headers limit from request object to parser
+  if (typeof req.maxHeadersCount === 'number') {
+    parser.maxHeaderPairs = req.maxHeadersCount << 1;
+  }
+
+  parser.onIncoming = parserOnIncomingClient;
+  socket.on('error', socketErrorListener);
+  socket.on('data', socketOnData);
+  socket.on('end', socketOnEnd);
+  socket.on('close', socketCloseListener);
+  socket.on('drain', ondrain);
+
+  if (
+    req.timeout !== undefined ||
+    (req.agent && req.agent.options && req.agent.options.timeout)
+  ) {
+    listenSocketTimeout(req);
+  }
+  req.emit('socket', socket);
+}
+```
+
+上面的逻辑比较简单，就是给req分配一个解析器。
+> 解析器的原理和作用，这里不再展开。有兴趣的读者可以去”nodejs如何处理高并发请求“一章中的【2.4.2 触发回调，设置解析器】查看。
+
+
+
+
+
 
 
 
