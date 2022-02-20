@@ -137,7 +137,7 @@ function request(url, options, cb) {
 ### 2.2 准备agent
 第二步：准备一个车队备用。
 
-即准备一个agent。
+即准备一个agent。这个动作是在初始化req的过程完成的。
 
 ```js
 // 文件地址：/lib/_http_client.js
@@ -177,8 +177,8 @@ module.exports = {
 ```
 可以看出，这里的globalAgent，就是进程启动时，初始化好的一个Agent实例。
 
-### 2.3 
-第三步：派车，根据“远程采购单”去执行任务。
+### 2.3 准备socket
+第三步：即派车。
 
 ```js
 // 文件地址：/lib/_http_client.js
@@ -213,6 +213,7 @@ function ClientRequest(input, options, cb) {
   }
 }
 ```
+
 上面的代码可以看出，如何派车，有两个选择：
 * 如果有agent（车队），则把请求交给agent来处理（由车队派车去处理，其他啥也不用管）
 * 如果没有agent（车队）：
@@ -221,9 +222,9 @@ function ClientRequest(input, options, cb) {
 
 > 无论是options.createConnection，还是net.createConnection，他们的底层实现，都是创建一个Socket实例（/lib/net.js中的Socket），来调用底层的tcp handle（以tcp使用场景为例），发起connect。
 
-我们先看第一个选择：使用agent(通过车队处理请求)
+我们先看第一个选择：使用agent准备socket(通过车队来派车)
 
-#### 2.3.1 通过agent发送请求
+#### 2.3.1 通过agent来准备socket
 
 就是上节代码中的
 ```js
@@ -232,7 +233,9 @@ if (this.agent) {
   this.agent.addRequest(this, options);
 }
 ```
-我们来看下，this.agent是如何通过addRequest处理请求的。
+>this.agent.addRequest的本意，是将req交给agent来处理。但是它还做了其他事情。
+>只看方法名，无法得知它的全部作用。
+>socket的准备工作，也是在它这里完成的。
 
 不过，在这之前，我们先来看下agent的庐山真面目。
 
@@ -313,11 +316,11 @@ installListeners里面，有一段代码：
 * 如果没有pending状态的请求，则放到freeSockets中待用（前提是可复用）
   * 是否可复用，是socket上一个req的属性，而非socket自身（读者可以忽略这一点）
 
-详细代码逻辑先不展开；先看下有了agent，怎么使用它发出请求。
+详细代码逻辑先不展开；先看下有了agent，接下来做什么。
 
 
-##### agent发送请求
-通过agent发送请求，其实就是通过把req添加到agent中来管理。
+##### 由agent分配socket
+通过agent处理请求，其实就是通过把req添加到agent中来管理。
 即this.agent.addRequest(this, options);
 
 ```js
@@ -400,8 +403,9 @@ function handleSocketCreation(agent, request, informRequest) {
 可以看出，这里也是调用了 setRequestSocket。
 
 总结：
-this.agent.addRequest(request)，其实就是找到一个socket（有空闲的直接使用，没有空闲的临时创建）；
-最后调用 setRequestSocket(agent, request, socket);
+* this.agent.addRequest(request)，其实就是找到一个socket（有空闲的直接使用，没有空闲的临时创建）；最后调用 setRequestSocket(agent, request, socket);
+
+* 通过agent来处理请求，本质就是通过agent来分配一个socket。
 
 接下来我们看setRequestSocket的逻辑。
 
@@ -417,7 +421,67 @@ function setRequestSocket(agent, req, socket) {
 }
 ```
 
-可以看出，这里调用了req.onSocket(socket); req就是request，即ClientRequest实例。我们看下它的逻辑。
+可以看出，这里调用了req.onSocket(socket); 
+>req就是request，即ClientRequest实例。
+
+接下来自然而然要分析req.onSocket(socket)，但是我们先挂起。
+
+为什么呢？
+
+先剧透一下：
+* 我们之前知道，发送请求的socket，可以通过agent来准备，也可以个性化指定。
+* 无论哪种方式，最终都是调用req.onSocket(socket)。
+
+所以我们最后再统一解读req.onSocket(socket)。
+
+接下来我们看另外一种准备socket的方式。
+
+#### 2.3.2 使用个性化socket
+通过指定个性化的车辆，直接发送请求
+
+我们继续来看ClientRequest的逻辑：
+
+```js
+// 文件地址：/lib/_http_client.js
+function ClientRequest(input, options, cb) {
+  ...
+  // 如果没有agent，则使用个性化的socket。
+  if (this.agent) {
+    this.agent.addRequest(this, options);
+  } else {
+    ...
+    // 如果用户给出了createConnection，则通过它来准备socket
+    if (typeof options.createConnection === 'function') {
+      const newSocket = options.createConnection(options, oncreate);
+      if (newSocket && !called) {
+        called = true;
+        this.onSocket(newSocket);
+      } else {
+        return;
+      }
+    } else {
+      // 否则，使用nodejs自带的net.createConnection来准备socket.
+      debug('CLIENT use net.createConnection', options);
+      this.onSocket(net.createConnection(options));
+    }
+  }
+}
+```
+
+可以看出,当不通过agent，直接创建socket时，有两种选择：
+* 如果用户有制定的createConnection，则使用它
+  * 创建完成后，调用this.onSocket(newSocket);
+* 否则，使用nodejs自带的net.createConnection。
+  * 创建完成后，调用this.onSocket(net.createConnection(options));
+
+无论哪种方式，创建完socket后，最终都调用了 this.onSocket(newSocket);
+
+这就是我们之前剧透的：无论哪种方式，最终都是调用req.onSocket(socket)。
+
+### 2.4 将请求通过socket发出去
+2.3节，我们分析了两种socket的准备方式。无论哪种方式，最终都是调用req.onSocket(socket)。
+
+接下来，我们就来详细解读req.onSocket()。
 
 ```js
 // 文件地址：/lib/_http_client.js
@@ -436,7 +500,8 @@ function onSocketNT(req, socket) {
 }
 ```
 
-可以看出，req.onSocket本质就是tickOnSocket(req, socket);我们继续看它的逻辑。
+可以看出，req.onSocket本质就是tickOnSocket(req, socket);
+
 
 ```js
 // 文件地址：/lib/_http_client.js
@@ -480,17 +545,22 @@ function tickOnSocket(req, socket) {
 }
 ```
 
-上面的逻辑比较简单，就是给req分配一个解析器。
+上面的逻辑比较简单：
+* 就是给req分配一个解析器。
+* 发送一个socket事件
+
 > 解析器的原理和作用，这里不再展开。有兴趣的读者可以去”nodejs如何处理高并发请求“一章中的【2.4.2 触发回调，设置解析器】查看。
 
+到这里，逻辑就非常清晰了：
+当准备好了socket,分配给req后，自然要emit一个socket事件；水到渠成。
+
+那么我们来看，接下来要做什么。
 
 
 
+### 2.5 socket回收
 
-
-
-
-##### agent发送请求后，socket回收
+#### 2.5.1 通过agent创建的socket回收
 ```js
 // 文件地址：/lib/_http_agent.js
 this.on('free', (socket, options) => {
@@ -549,6 +619,6 @@ this.on('free', (socket, options) => {
   });
 ```
 
-#### 2.3.2 通过指定车辆直接发送请求
+#### 2.5.2 个性化socket回收
 
 # 四.总结
