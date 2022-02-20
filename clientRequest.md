@@ -128,13 +128,13 @@ function request(url, options, cb) {
 从上面代码看出，http.request本质就是创建一个ClientRequest实例，我们看下它的代码。
 
 > 由于ClientRequest太长，有136行，所以我们逐块分析
-### 2.1 初始化实例req
+### 2.1 初始化请求实例req
 第一步：准备“远程采购单”。
 
 即通过创建一个实例req：new ClientRequest(url, options, cb)，来保存用户请求的各类信息。
 
 这个req，就是故事场景中的“远程采购单”；
-### 2.2 准备agent
+### 2.2 准备agent（如果需要）
 第二步：准备一个车队备用。
 
 即准备一个agent。这个动作是在初始化req的过程完成的。
@@ -556,11 +556,279 @@ function tickOnSocket(req, socket) {
 
 那么我们来看，接下来要做什么。
 
+接下来有两个动作：
+* 动作1：nodejs内部隐含的动作
+  * 即分配完socket后，触发了事件：req.emit('socket', socket);
+* 动作2：业务开发人员自己发起的动作
+  * 业务人员会往req写数据：req.write(dataChunk)
 
+我们先看“nodejs内部隐含的动作”--req.emit('socket', socket)会触发什么。
+
+##### 动作1：req.emit('socket', socket)
+在初始化请求的时候，最后有一段代码
+```js
+// 文件地址：/lib/_http_client.js
+function ClientRequest(input, options, cb) {
+  ...
+  this._deferToConnect(null, null, () => this._flush());
+}
+```
+
+这段代码的含义为：等req分配好socket后，触发() => this._flush()。
+> _deferToConnect如果换个名字，读者会更加清晰它的含义：doAfterReqGotASocket 或者 doOnceSocketAssignedToReq
+
+我们看下 _deferToConnect的代码：
+```js
+function _deferToConnect(method, arguments_, cb) {
+  // This function is for calls that need to happen once the socket is
+  // assigned to this request and writable. It's an important promisy
+  // thing for all the socket calls that happen either now
+  // (when a socket is assigned) or in the future (when a socket gets
+  // assigned out of the pool and is eventually writable).
+
+  const callSocketMethod = () => {
+    if (method)
+      this.socket[method].apply(this.socket, arguments_);
+
+    if (typeof cb === 'function')
+      cb();
+  };
+
+  const onSocket = () => {
+    if (this.socket.writable) {
+      callSocketMethod();
+    } else {
+      this.socket.once('connect', callSocketMethod);
+    }
+  };
+
+  if (!this.socket) {
+    this.once('socket', onSocket);
+  } else {
+    onSocket();
+  }
+}
+```
+
+从上面的代码可以看出，这里的逻辑很简单：
+* 如果req分配了socket，则直接调用回调
+* 如果没有，则先监听socket事件，等有socket事件触发时，再调用回调
+
+通过之前分析得知，把socket分配给req是通过req.onSocket来完成的。这个动作是在process.nextTick来完成。
+所以，在调用_deferToConnect时，req.socket还没有；因此_deferToConnect代码里面，走的是if (!this.socket) 路径，即监听了socket事件。
+
+所以，在req.onSocket触发了socket事件后（req.emit('socket', socket)），将会执行 _deferToConnect中的onSocket。
+
+onSocket判断，当socket可写时，执行传入的cb。这个cb就是: () => this._flush();
+
+我们看下this._flush:
+
+```js
+// 文件地址：/lib/_http_outgoing.js
+OutgoingMessage.prototype._flush = function _flush() {
+  const socket = this.socket;
+  if (socket && socket.writable) {
+    // There might be remaining data in this.output; write it out
+    const ret = this._flushOutput(socket);
+    ...
+  }
+};
+
+OutgoingMessage.prototype._flushOutput = function _flushOutput(socket) {
+  ...
+  const outputData = this.outputData;
+  ...
+  let ret;
+  for (let i = 0; i < outputLength; i++) {
+    const { data, encoding, callback } = outputData[i];
+    ret = socket.write(data, encoding, callback);
+  }
+  ...
+  return ret;
+};
+```
+
+可以看出，这里_flush最终通过_flushOutput，把req挤压的消息（outputData）通过socket发送出去
+
+
+接下来我们再看“业务开发人员自己发起的动作”--req.write(dataChunk)
+##### 动作2：req.write(dataChunk)
+
+下看用户代码：
+```js
+// 样例代码
+let dataChunk = ...
+let req = http.request(...);
+req.write(dataChunk);
+req.end();
+```
+
+可以看出，当用户创建完req后，就立刻往req写数据。
+
+> 注意：动作1中的_flush是在process.nextTick中完成的，因此动作1的_flush要晚于动作2的req.write。
+
+我们看下req.write:
+
+```js
+// 文件地址：/lib/_http_outgoing.js
+OutgoingMessage.prototype.write = function write(chunk, encoding, callback) {
+  const ret = write_(this, chunk, encoding, callback, false);
+  if (!ret)
+    this[kNeedDrain] = true;
+  return ret;
+};
+
+function write_(msg, chunk, encoding, callback, fromEnd) {
+  ...
+  // 1.如果没有头部，设置默认的头部：即设置msg._header
+  // 注意：msg._header会包含http协议的首行：GET /index.html HTTP/1.1\r\n（请求） 或者 HTTP/1.1 200 OK\r\n （返回）
+  if (!msg._header) {
+    msg._implicitHeader();
+  }
+
+  // 2.如果这个req类型是没有body（比如head）,则直接返回 
+  // 注意：目前的标准下，get类型的请求是可以有body的。只不过很多实现里面并不会往get里面写body数据。
+  if (!msg._hasBody) {
+    debug('This type of response MUST NOT have a body. ' +
+          'Ignoring write() calls.');
+    if (callback) process.nextTick(callback);
+    return true;
+  }
+
+  ...
+  // 3.调用_send发送数据
+  let ret;
+  if (msg.chunkedEncoding && chunk.length !== 0) {
+    let len;
+    if (typeof chunk === 'string')
+      len = Buffer.byteLength(chunk, encoding);
+    else
+      len = chunk.length;
+
+    msg._send(len.toString(16), 'latin1', null);
+    msg._send(crlf_buf, null, null);
+    msg._send(chunk, encoding, null);
+    ret = msg._send(crlf_buf, null, callback);
+  } else {
+    ret = msg._send(chunk, encoding, callback);
+  }
+
+  debug('write ret = ' + ret);
+  return ret;
+}
+```
+
+write逻辑归纳为：
+* 如果没有header，则填上默认的
+* 然后通过_send发送数据。
+
+那么我们来看下_send的代码。
+
+```js
+// 文件地址：/lib/_http_outgoing.js
+OutgoingMessage.prototype._send = function _send(data, encoding, callback) {
+  // This is a shameful hack to get the headers and first body chunk onto
+  // the same packet. Future versions of Node are going to take care of
+  // this at a lower level and in a more general way.
+  if (!this._headerSent) {
+    if (typeof data === 'string' &&
+        (encoding === 'utf8' || encoding === 'latin1' || !encoding)) {
+      data = this._header + data;
+    } else {
+      const header = this._header;
+      if (this.outputData.length === 0) {
+        this.outputData = [{
+          data: header,
+          encoding: 'latin1',
+          callback: null
+        }];
+      } else {
+        this.outputData.unshift({
+          data: header,
+          encoding: 'latin1',
+          callback: null
+        });
+      }
+      this.outputSize += header.length;
+      this._onPendingData(header.length);
+    }
+    this._headerSent = true;
+  }
+  return this._writeRaw(data, encoding, callback);
+};
+```
+
+>一个请求，可能会发送多个数据片段（即调用多次req.write）,所以代码要做抽象
+_send的代码逻辑总结为：
+* 如果头部已经发送，则直接调用_writeRaw把本次要写入的数据写入socket
+* 如果头部没有发送：
+  * 如果data是字符串，则把头部拼接到data前面，然后调用_writeRaw
+  * 如果data不是字符串，则先把header缓存到outputData中，然后调用_writeRaw
+
+我们来看_writeRaw的逻辑。
+
+```js
+// 文件地址：/lib/_http_outgoing.js
+function _writeRaw(data, encoding, callback) {
+  const conn = this.socket;
+  ...
+
+  if (conn && conn._httpMessage === this && conn.writable) {
+    // There might be pending data in the this.output buffer.
+    if (this.outputData.length) {
+      this._flushOutput(conn);
+    }
+    // Directly write to socket.
+    return conn.write(data, encoding, callback);
+  }
+  // Buffer, as long as we're not destroyed.
+  this.outputData.push({ data, encoding, callback });
+  this.outputSize += data.length;
+  this._onPendingData(data.length);
+  return this.outputSize < HIGH_WATER_MARK;
+}
+```
+
+代码逻辑也很简单：
+* 如果socket可写：
+  * 如果outputData中有数据，先flush发送出去，然后在发送本次数据
+  * 否则，直接发送本次数据
+* 如果socket不可写，继续缓存到outputData
+
+如果是第二种情况，那么数据会缓存到outputData。
+
+> 我们知道，动作2完成后，还有个动作1。即“动作1：req.emit('socket', socket)”小节中，还有个最终的_flush。
+> 这个_flush将会再次尝试，把outputData中的数据写到socket发出去，来进行收尾。
+
+
+完整的流程为：
+![req.write](./img_hand/reqWrite.png)
 
 ### 2.5 socket回收
+上面我们讲完了发送请求。当请求完成后，socket将面临两个选择：重复使用（来发送其他请求）或者销毁。
+
+我们来分情况看下socket的回收流程。
 
 #### 2.5.1 通过agent创建的socket回收
+
+我们知道，nodejs是通过req.onSocket来分配socket的。其中有一段逻辑是这样的：
+
+```js
+function tickOnSocket(req, socket) {
+  ...
+  // 注册事件
+  parser.onIncoming = parserOnIncomingClient;
+  socket.on('error', socketErrorListener);
+  socket.on('data', socketOnData);
+  socket.on('end', socketOnEnd);
+  socket.on('close', socketCloseListener);
+  socket.on('drain', ondrain);
+  ...
+}
+```
+
+当socket把请求处理完成后，最后发
+
 ```js
 // 文件地址：/lib/_http_agent.js
 this.on('free', (socket, options) => {
