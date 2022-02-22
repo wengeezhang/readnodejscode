@@ -55,7 +55,7 @@
 
 有一天，又来了一位顾客李大妈，她也要采购2桶麻油（同样需要远程采购）。但是李大妈觉着店铺的车队不靠谱，自己带了司机和车辆去取货。
 
-但是为了不影响整体流程（“采购信息管理中心”这个职能中心的职责不变），所以李大妈自己带来的司机，还是要承接“采购信息管理中心”输出的“远程采购单”。
+但是为了不影响整体流程（“采购信息管理中心”这个职能中心的职责不变），所以李大妈自己带来的司机，只有拿到“采购信息管理中心”输出的“远程采购单”，才能去采购。
 
 因此这种特殊场景下的流程调整为：
 * 顾客把要采购的东西告诉“客户管理机器人”
@@ -74,9 +74,9 @@
 
 ## 2.关联
 * 王大妈  --> 用户
-* 客户管理机器人 --> 主线程
+* 客户管理机器人 --> nodejs主线程
 * 采购信息管理中心 --> http.ClientRequest(即/lib/_http_client.js中的ClientRequest)
-* 远程采购单 --> req（即http.ClientRequest实例）
+* 远程采购单 --> req（即http.ClientRequest生成的实例）
 * 车队管理中心 --> http.Agent(即/lib/_http_agent.js中的Agent)
 * 车(司机) --> 即socket（也就是connection，对应/lib/net.js中的Socket实例）
 
@@ -235,7 +235,7 @@ if (this.agent) {
 ```
 >this.agent.addRequest的本意，是将req交给agent来处理。但是它还做了其他事情。
 >只看方法名，无法得知它的全部作用。
->socket的准备工作，也是在它这里完成的。
+>其实socket的准备工作，也是在它这里完成的。
 
 不过，在这之前，我们先来看下agent的庐山真面目。
 
@@ -316,7 +316,7 @@ installListeners里面，有一段代码：
 * 如果没有pending状态的请求，则放到freeSockets中待用（前提是可复用）
   * 是否可复用，是socket上一个req的属性，而非socket自身（读者可以忽略这一点）
 
-详细代码逻辑先不展开；先看下有了agent，接下来做什么。
+详细代码逻辑先不展开；现在有了agent，接下来要做什么呢？
 
 
 ##### 由agent分配socket
@@ -434,7 +434,7 @@ function setRequestSocket(agent, req, socket) {
 
 所以我们最后再统一解读req.onSocket(socket)。
 
-接下来我们看另外一种准备socket的方式。
+接下来我们看另外一种准备socket的方式：使用个性化socket。
 
 #### 2.3.2 使用个性化socket
 通过指定个性化的车辆，直接发送请求
@@ -648,7 +648,7 @@ OutgoingMessage.prototype._flushOutput = function _flushOutput(socket) {
 };
 ```
 
-可以看出，这里_flush最终通过_flushOutput，把req挤压的消息（outputData）通过socket发送出去
+可以看出，这里_flush最终通过_flushOutput，把req积压的消息（outputData）通过socket发送出去
 
 
 接下来我们再看“业务开发人员自己发起的动作”--req.write(dataChunk)
@@ -790,12 +790,10 @@ function _writeRaw(data, encoding, callback) {
 ```
 
 代码逻辑也很简单：
-* 如果socket可写：
+* 如果有分配好socket，且可写：
   * 如果outputData中有数据，先flush发送出去，然后在发送本次数据
   * 否则，直接发送本次数据
-* 如果socket不可写，继续缓存到outputData
-
-如果是第二种情况，那么数据会缓存到outputData。
+* 否则，缓存到outputData
 
 > 我们知道，动作2完成后，还有个动作1。即“动作1：req.emit('socket', socket)”小节中，还有个最终的_flush。
 > 这个_flush将会再次尝试，把outputData中的数据写到socket发出去，来进行收尾。
@@ -803,7 +801,19 @@ function _writeRaw(data, encoding, callback) {
 
 完整的流程为：
 ![req.write](./img_hand/reqWrite.png)
+![req.write2](./img_hand/reqWriteHandle.png)
 
+这里总结一下：
+* 初始化req后，如果是直接往里面写数据，此时因为socket还没有准备好，所以数据一定是缓存到req.outputData中（req的父类outgoing中的一个属性）
+  * 这里头部的发送判断比较清晰，就是加到data之前，然后缓存到outputdata。
+* 初始化req后，如果等一段事件，socket分配好了，此时再往req里面写数据，则分情况
+  * 第一次写，肯定没有发送header，则：
+    * 如果是字符串，则将头部拼接到body数据前，直接发送
+    * 否则，先把header放到outputData数组的前面；接着发送body，再发送body之前，都会有一个_flushOutput（此时把头部发出去）
+  * 后续的写，则直接往socket写
+
+>注意：只要socket能写，就往里写，否则（比如socket的buffer满了），则依然缓存到req的outputData中
+>因为往socket写的时候，是把outputData前面的先写，后面加入到req的，一定是在outputData的末尾。所以顺序一定不会错。
 ### 2.5 socket回收
 上面我们讲完了发送请求。当请求完成后，socket将面临两个选择：重复使用（来发送其他请求）或者销毁。
 
