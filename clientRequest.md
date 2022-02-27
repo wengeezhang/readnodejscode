@@ -803,7 +803,10 @@ function _writeRaw(data, encoding, callback) {
 ![req.write](./img_hand/reqWrite.png)
 ![req.write2](./img_hand/reqWriteHandle.png)
 
+agent的keepAlive vs req的shouldKeepAlive vs req的header的connection: keep-alive：
+
 ![req.shouldKeepAlive](./img_hand/shouldKeepAlive.png)
+
 
 这里总结一下：
 * 初始化req后，如果是直接往里面写数据，此时因为socket还没有准备好，所以数据一定是缓存到req.outputData中（req的父类outgoing中的一个属性）
