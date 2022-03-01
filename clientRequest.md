@@ -75,8 +75,8 @@
 ## 2.关联
 * 王大妈  --> 用户
 * 客户管理机器人 --> nodejs主线程
-* 采购信息管理中心 --> http.ClientRequest(即/lib/_http_client.js中的ClientRequest)
-* 远程采购单 --> req（即http.ClientRequest生成的实例）
+* 采购信息管理中心 --> 业务代码（由业务决定发起请求的参数）
+* 远程采购单 --> req（即http.ClientRequest的实例）
 * 车队管理中心 --> http.Agent(即/lib/_http_agent.js中的Agent)
 * 车(司机) --> 即socket（也就是connection，对应/lib/net.js中的Socket实例）
 
@@ -311,10 +311,9 @@ installListeners里面，有一段代码：
 > * onFree会接着触发agent.emit('free', s, options);
 > * 由于agent监听过free，this.on('free', cb)，所以cb被执行
 
-我们先剧透下cb的逻辑：当有socket空闲出来时
+我们先剧透下cb的逻辑：
 * 检测是否有pending状态的请求，如果有，则直接使用这个空闲出来的socket发送出去
 * 如果没有pending状态的请求，则放到freeSockets中待用（前提是可复用）
-  * 是否可复用，是socket上一个req的属性，而非socket自身（读者可以忽略这一点）
 
 详细代码逻辑先不展开；现在有了agent，接下来要做什么呢？
 
@@ -437,7 +436,7 @@ function setRequestSocket(agent, req, socket) {
 接下来我们看另外一种准备socket的方式：使用个性化socket。
 
 #### 2.3.2 使用个性化socket
-通过指定个性化的车辆，直接发送请求
+即故事场景中通过指定个性化的车辆，直接去取货。
 
 我们继续来看ClientRequest的逻辑：
 
@@ -547,7 +546,7 @@ function tickOnSocket(req, socket) {
 
 上面的逻辑比较简单：
 * 就是给req分配一个解析器。
-* 发送一个socket事件
+* 触发一个socket事件
 
 > 解析器的原理和作用，这里不再展开。有兴趣的读者可以去”nodejs如何处理高并发请求“一章中的【2.4.2 触发回调，设置解析器】查看。
 
@@ -557,10 +556,10 @@ function tickOnSocket(req, socket) {
 那么我们来看，接下来要做什么。
 
 接下来有两个动作：
-* 动作1：nodejs内部隐含的动作
-  * 即分配完socket后，触发了事件：req.emit('socket', socket);
-* 动作2：业务开发人员自己发起的动作
-  * 业务人员会往req写数据：req.write(dataChunk)
+* 动作1：nodejs内部隐含的动作--req.emit('socket', socket)；
+  * 即分配完socket后，触发了该事件;
+* 动作2：业务开发人员自己发起的动作--req.write(dataChunk)；
+  * 业务人员会往req写数据
 
 我们先看“nodejs内部隐含的动作”--req.emit('socket', socket)会触发什么。
 
@@ -651,10 +650,10 @@ OutgoingMessage.prototype._flushOutput = function _flushOutput(socket) {
 可以看出，这里_flush最终通过_flushOutput，把req积压的消息（outputData）通过socket发送出去
 
 
-接下来我们再看“业务开发人员自己发起的动作”--req.write(dataChunk)
+接下来我们再看动作2--req.write(dataChunk)
 ##### 动作2：req.write(dataChunk)
 
-下看用户代码：
+先看样例代码：
 ```js
 // 样例代码
 let dataChunk = ...
@@ -665,7 +664,7 @@ req.end();
 
 可以看出，当用户创建完req后，就立刻往req写数据。
 
-> 注意：动作1中的_flush是在process.nextTick中完成的，因此动作1的_flush要晚于动作2的req.write。
+> 注意：动作1中的_flush是在process.nextTick中完成的，因此在这个样例中，动作1的_flush要晚于动作2的req.write。
 
 我们看下req.write:
 
@@ -803,11 +802,6 @@ function _writeRaw(data, encoding, callback) {
 ![req.write](./img_hand/reqWrite.png)
 ![req.write2](./img_hand/reqWriteHandle.png)
 
-agent的keepAlive vs req的shouldKeepAlive vs req的header的connection: keep-alive：
-
-![req.shouldKeepAlive](./img_hand/shouldKeepAlive.png)
-
-
 这里总结一下：
 * 初始化req后，如果是直接往里面写数据，此时因为socket还没有准备好，所以数据一定是缓存到req.outputData中（req的父类outgoing中的一个属性）
   * 这里头部的发送判断比较清晰，就是加到data之前，然后缓存到outputdata。
@@ -820,9 +814,170 @@ agent的keepAlive vs req的shouldKeepAlive vs req的header的connection: keep-al
 >注意：只要socket能写，就往里写，否则（比如socket的buffer满了），则依然缓存到req的outputData中
 >因为往socket写的时候，是把outputData前面的先写，后面加入到req的，一定是在outputData的末尾。所以顺序一定不会错。
 ### 2.5 socket回收
+
 上面我们讲完了发送请求。当请求完成后，socket将面临两个选择：重复使用（来发送其他请求）或者销毁。
 
-我们来分情况看下socket的回收流程。
+socket的回收，其实是nodejs里面非常重要的逻辑；同时它的处理方式又很晦涩难懂。我们结合故事，来尝试解读一下。
+
+#### 2.5.1 故事演绎
+
+在我们的故事场景中，用户采购的东西，通过“采购信息管理中心”生成了“远程采购单”；然后转交给“车队管理中心”派车去采购。
+
+我们先来假设一下“车队管理中心”的管理步骤：
+1. 所有车辆都存放在车库；
+2. 单子到达后，从车库拖出一辆车，去采购；
+3. 采购回来，车子先停在“暂停区”，把货物卸下交给“采购信息管理中心”完事。
+4. 此时车队有两种选择：
+    * A:车子继续停留在“暂停区”，等待后续采购单；
+    * B:车子立即挪进车库。
+
+用图来说明，就是以下两种情况
+A:车子继续停留在“暂停区”：
+![keepAliveTrue](./img_unit/unit/unit.072.png)
+B:车子立即挪进车库：
+![keepAliveFalse](./img_unit/unit/unit.073.png)
+
+两种情况各有优缺点：
+* A:车子继续停留在“暂停区”:
+  * 优点：下次再有相同的取货单，可以立即出发
+  * 缺点：车子要一直停在“暂存区”，要付出管理成本
+* B:车子立即挪进车库：
+  * 优点：不用额外管理，干干净净；
+  * 缺点：下次再有相同的取货单，要重新把车从车库拖出来，费时费力。
+
+到底选择哪种方案呢？其实两种方案都要保留。
+
+故事中，“车队管理中心”的上游是“采购信息管理中心”。只有上游才知道短时间内有多少采购单。“车队管理中心”只知道干好活，其他一概不关心。
+
+因此，车辆完成任务后，是挪进车库还是停留在“暂存区”，决策权应该交给“采购信息管理中心”。
+
+> 注意：“采购信息管理中心”拥有决策权，这个结论非常重要。
+> 车辆自己是死的，它没有任何主观能力。
+
+“采购信息管理中心”和“车队管理中心”之间，唯一的沟通媒介就是“远程采购单”。因此决定车辆是否入库的决策信息，就保存在“远程采购单”中。
+
+
+#### 2.5.2 代码映射解读
+
+根据2.5.1的故事演绎，我们来看下nodejs代码中各个模块是如何各司其职，完成这个决策流程的。
+
+##### 1.决策点：
+业务代码（即故事中的“采购信息管理中心”），事先知道有多少请求，因此它在创建请求（即故事中的“远程采购单”）时，会主动设置一个头部：connection：keep-alive/false。
+
+另外，我们知道，请求是通过agent分配socket发出去的。socket由agent来管理。因此agent的管理方式，也会影响决策信息。
+agent是通过keepAlive属性（私以为这个属性名起的不好，会跟connection: keep-alive混淆；如果改成doNotDestorySocketAfterUse会更合适）来管理的。
+agent.keepAlive的值：
+* 如果为true，那么它管辖下的socket使用后，不会被销毁。下次有同域的请求会直接拿来复用。
+* 如果为false，则它管辖下的socket使用后，会被销毁
+
+> 注意：上面agent.keepAlive=false的描述不精确，因为还有个maxSockets是否为infinity配合决策。具体情况要更复杂一些。
+
+总结一下，决策点有两个：
+* 业务指定的头部：connection:keep-alive/close
+* agent的keepAlive：true/false
+
+这两个决策点分别有什么指导意义呢？
+
+先看第一个决策点。
+###### connection:keep-alive/close。
+
+对于http的持久链接，有一个官方标标准[RFC 2616](https://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html)，它里面有关于客户端和服务端的协商机制。我们这里贴出来：
+>An HTTP/1.1 server MAY assume that a HTTP/1.1 client intends to maintain a persistent connection unless a Connection header including the connection-token "close" was sent in the request. If the server chooses to close the connection immediately after sending the response, it SHOULD send a Connection header including the connection-token close.
+>
+>An HTTP/1.1 client MAY expect a connection to remain open, but would decide to keep it open based on whether the response from a server contains a Connection header with the connection-token close. In case the client does not want to maintain a connection for more than that request, it SHOULD send a Connection header including the connection-token close.
+>
+>If either the client or the server sends the close token in the Connection header, that request becomes the last one for the connection.
+>
+>Clients and servers SHOULD NOT assume that a persistent connection is maintained for HTTP versions less than 1.1 unless it is explicitly signaled. See section 19.6.2 for more information on backward compatibility with HTTP/1.0 clients.
+>
+>In order to remain persistent, all messages on the connection MUST have a self-defined message length (i.e., one not defined by closure of the connection), as described in section 4.4.
+
+总结一下就是，双方通过头部connection来协商是否创建持久化链接：
+
+* 当client/server任意一方设置为connection:close时，链接用完后立即销毁。
+* 当client设置connection:keep-alive时：
+  * 如果server返回了connection:close头部，链接用完后，也会销毁。
+  * 如果server返回了connection:keep-alive头部，则表明双方都想要持久化，此时的链接就可以长期保持。
+
+接着看第二个决策点。
+###### agent.keepAlive：true/false
+
+链接（socket）最终是由agent来管理的。所以光有客户端和服务器协商好还不行，还要链接的管理者（agent）同意才行。
+
+如果agent不同意，那链接（socket）也会被销毁。
+
+agent是否同意，就是通过agent.keepAlive这个属性.
+
+#####  2.将决策点汇总成为决策信息：
+有了决策点，还要汇总，形成最终的决策信息。然后把汇总的决策信息保存在请求的一个熟悉上，即req.shouldKeepAlive。
+>req.shouldKeepAlive又是一个容易让人混淆的名次；
+>如果改成：saveSocketFinalDecisionMaker--socket存活的最终决策者，可能会好点.
+
+由于这里的流程太过晦涩难懂，所以我们分情况来逐一分析，最终一探究竟。
+
+****1.客户端不同意，agent也不同意****
+
+决策点：connection:close，agent.keepAlive=false.
+
+决策信息：
+发起请求时：req.shouldKeepAlive=false;
+收到返回时：req.shouldKeepAlive=false;
+
+最终结果：
+socket被销毁
+
+****2.客户端不同意，agent同意****
+
+决策点：connection:close，agent.keepAlive=true.
+
+决策信息：
+发起请求时：req.shouldKeepAlive=true;
+收到返回时：req.shouldKeepAlive=false;
+
+最终结果：
+socket被销毁
+
+> 以上两种情况，因为客户端不同意，所以服务端肯定会返回不同意。
+****3.客户端同意，agent不同意****
+
+决策点：connection:keep-alive，agent.keepAlive=false.
+
+决策信息：
+发起请求时：req.shouldKeepAlive=false;
+收到返回时：req.shouldKeepAlive=false;
+
+最终结果：
+socket被销毁
+
+****4.客户端同意，agent同意：服务器不同意****
+
+决策点：connection:keep-alive，agent.keepAlive=true.
+
+决策信息：
+发起请求时：req.shouldKeepAlive=true;
+收到返回时：req.shouldKeepAlive=false;
+
+最终结果：
+socket被销毁
+
+****5.客户端同意，agent同意：服务器同意****
+
+决策点：connection:keep-alive，agent.keepAlive=true.
+
+决策信息：
+发起请求时：req.shouldKeepAlive=true;
+收到返回时：req.shouldKeepAlive=true;
+
+最终结果：
+socket被保留在agent中，供下次复用。
+
+![req.shouldKeepAlive](./img_hand/shouldKeepAlive.png)
+![req.shouldKeepAliveMean](./img_hand/shouldKeepAliveMean.png)
+req._removedConnection: 此字段表示发出去的header中是否去除了connection字段。
+removeHeader里，如果检测到connection去除，会将此字段设置为true
+matchHeader（即_storeHeader调用），如果检测到connection设置，会将此字段设置为false.
+
+后面_storeHeader会再次检测_removedConnection，如果为true，则标识即将发出去的头部没有connection头，则默认为后续不会有新的请求，对应的socket不会被复用。
 
 #### 2.5.1 通过agent创建的socket回收
 
@@ -903,5 +1058,7 @@ this.on('free', (socket, options) => {
 ```
 
 #### 2.5.2 个性化socket回收
+
+
 
 # 四.总结
