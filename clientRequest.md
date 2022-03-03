@@ -856,7 +856,7 @@ B:车子立即挪进车库：
 
 到底选择哪种方案呢？其实两种方案都要保留。
 
-故事中，“车队管理中心”的上游是“采购信息管理中心”。只有上游才知道短时间内有多少采购单。“车队管理中心”只知道干好活，其他一概不关心。
+故事中，“车队管理中心”的上游是“采购信息管理中心”。只有上游才知道短时间内有多少采购单。“车队管理中心”只知道干好活，它并不知道今天会有多少采购需求。
 
 因此，车辆完成任务后，是挪进车库还是停留在“暂存区”，决策权应该交给“采购信息管理中心”。
 
@@ -865,6 +865,9 @@ B:车子立即挪进车库：
 
 “采购信息管理中心”和“车队管理中心”之间，唯一的沟通媒介就是“远程采购单”。因此决定车辆是否入库的决策信息，就保存在“远程采购单”中。
 
+也就是说，“远程采购单”是“采购信息管理中心”的全权代表，来指示“车队管理中心”的车辆怎么干活（是停留在“暂停区”还是入库）。
+
+> “采购信息管理中心”的地位，比“车队管理中心”高。因此要优先照顾前者的需求。
 
 #### 2.5.2 代码映射解读
 
@@ -930,6 +933,7 @@ agent是否同意，就是通过agent.keepAlive这个属性来设置的.
 决策点：connection:close，agent.keepAlive=false.
 
 决策信息req.shouldKeepAlive的值：
+初始化设置：false;
 发起请求时：false;
 收到返回时：false;
 最终设置为：false
@@ -942,6 +946,7 @@ socket被销毁
 决策点：connection:close，agent.keepAlive=true.
 
 决策信息req.shouldKeepAlive的值：
+初始化设置：true;
 发起请求时：true;
 收到返回时：false;
 最终设置为：false
@@ -949,24 +954,14 @@ socket被销毁
 结果：
 socket被销毁
 
-> 以上两种情况，因为客户端不同意，所以服务端肯定会返回不同意。
-****3.客户端同意，agent不同意****
+> 因为客户端不同意，所以服务端肯定会返回不同意。所以虽然一开始req.shouldKeepAlive为true，收到请求后，被扭转为了false。
+
+****3.客户端同意，agent不同意, 服务端不同意****
 
 决策点：connection:keep-alive，agent.keepAlive=false.
 
 决策信息req.shouldKeepAlive的值：
-发起请求时：false;
-收到返回时：false;
-最终设置为：false
-
-结果：
-socket被销毁
-
-****4.客户端同意，agent同意，服务器不同意****
-
-决策点：connection:keep-alive，agent.keepAlive=true.
-
-决策信息req.shouldKeepAlive的值：
+初始化设置：false;
 发起请求时：true;
 收到返回时：false;
 最终设置为：false
@@ -974,11 +969,40 @@ socket被销毁
 结果：
 socket被销毁
 
-****5.客户端同意，agent同意，服务器同意****
+****4.客户端同意，agent不同意, 服务端同意****
+
+决策点：connection:keep-alive，agent.keepAlive=false.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：false;
+发起请求时：true;
+收到返回时：true;
+最终设置为：true
+
+结果：
+如果有pending状态的请求，socket被复用；
+如果没有，socket被销毁。
+
+
+****5.客户端同意，agent同意，服务器不同意****
 
 决策点：connection:keep-alive，agent.keepAlive=true.
 
 决策信息req.shouldKeepAlive的值：
+初始化设置：true;
+发起请求时：true;
+收到返回时：false;
+最终设置为：false
+
+结果：
+socket被销毁
+
+****6.客户端同意，agent同意，服务器同意****
+
+决策点：connection:keep-alive，agent.keepAlive=true.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：true;
 发起请求时：true;
 收到返回时：true;
 最终设置为：true
@@ -986,40 +1010,43 @@ socket被销毁
 结果：
 socket被保留在agent中，供下次复用。
 
-****6.客户端未设置connection，agent不同意****
+****7.客户端未设置connection，agent不同意****
 
 决策点：agent.keepAlive=false.
 
 决策信息req.shouldKeepAlive的值：
+初始化设置：false;
 发起请求时：false;
 收到返回时：false;
 最终设置为：false
 
 结果：
-socket被保留在agent中，供下次复用。
+socket被销毁。
 
 > 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为false；同时根据这个信息，在msg._implicitHeader中设置为connection:close
 
-****7.客户端未设置connection，agent同意，服务器不同意****
+****8.客户端未设置connection，agent同意，服务器不同意****
 
 决策点：agent.keepAlive=true.
 
 决策信息req.shouldKeepAlive的值：
+初始化设置：true;
 发起请求时：true;
 收到返回时：false;
 最终设置为：false
 
 结果：
-socket被保留在agent中，供下次复用。
+socket被销毁。
 
 > 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为true；同时根据这个信息，在msg._implicitHeader中设置为connection:keep-alive.
 > 尽管如此，但是服务器不同意。所以收到的返回头connection:close，nodejs最终会把req.shouldKeepAlive设置为false
 
-****8.客户端未设置connection，agent同意，服务器同意****
+****9.客户端未设置connection，agent同意，服务器同意****
 
 决策点：agent.keepAlive=true.
 
 决策信息req.shouldKeepAlive的值：
+初始化设置：true;
 发起请求时：true;
 收到返回时：true;
 最终设置为：true
@@ -1029,10 +1056,15 @@ socket被保留在agent中，供下次复用。
 
 > 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为true；同时根据这个信息，在msg._implicitHeader中设置为connection:keep-alive
 
-总结一下，只有5和8出现了socket复用，即满足以下三个条件：
-* agent同意复用；
-* 服务器同意复用；
-* 客户端没有设置connection:close。
+总结一下，只有4、6、9出现了socket复用，即满足以下三个条件：
+* 客户端和服务端同意，无论agent是否同意，都可能被复用
+  * agent同意，那么直接保留复用。
+  * agent不同意，如果有挤压的需求，那复用；如果没有挤压的需求，则销毁
+* agent和服务器同意，客户端没有设置connection:close时，就会被复用。
+
+>引申一下就是:
+>agent和服务器都是给client服务的。两个干活的都同意了，client只要没有明确表明要销毁，那就一律复用。
+>虽然都是干活的，agent的地位最低。只要client和服务器协商同意复用，即使agent的不愿意复用，也不行：只要有挤压的请求，agent管辖的socket必须复用。
 
 >我们来看下nodejs源码中，对于初始化req时，对于req.shouldKeepAlive的决策注释。希望这部分信息能够给读者提供一些帮助，一探其设计理念。
 >If there is an agent we should default to Connection:keep-alive,
@@ -1058,7 +1090,7 @@ req.write('xxx');
 req.end();
 ```
 
-样例代码中，创建req时，传入了一个keepAlive的agent，我们来看下这里的逻辑。
+样例代码中，创建req时，传入了一个keepAlive的newAgent，我们来看下这里的逻辑。
 
 ```js
 // 文件地址：/lib/_http_client.js
@@ -1079,7 +1111,9 @@ if (this.agent) {
 
 可以看出，初始化的req（即this）的shouldKeepAlive被设置为了true。
 
-紧接着，样例代码调用了req.write('xx');我们看下这个逻辑。
+紧接着，样例代码调用了req.write('xx');
+req继承了outgoing，因此req.write就是OutgoingMessage.prototype.write。
+我们看下这个逻辑。
 
 ```js
 // 文件地址：/lib/_http_outgoing.js
@@ -1101,13 +1135,12 @@ function write_(msg, chunk, encoding, callback, fromEnd) {
 
 ```
 
-req继承了outgoing，因此req.write就是OutgoingMessage.prototype.write。
-
 从上面代码看到，write调用了write_。
 
-write_代码里面判断是否有头部（!msg._header）。此时是第一次写，因此还没有，所以这里进行设置，即调用msg._implicitHeader。
+write_代码里面判断是否有头部（!msg._header）。由于此时是第一次写，因此还没有msg._header，所以这里进行设置，即调用msg._implicitHeader。
 
-> ClientRequest继承了OutgoingMessage。因此这里会出现相互使用原型方法的情况。
+> 注意：
+ClientRequest继承了OutgoingMessage。
 
 ```js
 // 文件地址：/lib/_http_client.js
@@ -1140,97 +1173,50 @@ function _storeHeader(firstLine, headers) {
         const entry = headers[key];
         processHeader(this, state, entry[0], entry[1], false);
       }
-    } else if (ArrayIsArray(headers)) {
-      for (const entry of headers) {
-        processHeader(this, state, entry[0], entry[1], true);
-      }
-    } else {
-      for (const key in headers) {
-        if (ObjectPrototypeHasOwnProperty(headers, key)) {
-          processHeader(this, state, key, headers[key], true);
-        }
-      }
-    }
+    } ...
   }
 
   let { header } = state;
-
-  // Date header
-  if (this.sendDate && !state.date) {
-    header += 'Date: ' + utcDate() + CRLF;
-  }
-
-  // Force the connection to close when the response is a 204 No Content or
-  // a 304 Not Modified and the user has set a "Transfer-Encoding: chunked"
-  // header.
-  //
-  // RFC 2616 mandates that 204 and 304 responses MUST NOT have a body but
-  // node.js used to send out a zero chunk anyway to accommodate clients
-  // that don't have special handling for those responses.
-  //
-  // It was pointed out that this might confuse reverse proxies to the point
-  // of creating security liabilities, so suppress the zero chunk and force
-  // the connection to close.
-  if (this.chunkedEncoding && (this.statusCode === 204 ||
-                               this.statusCode === 304)) {
-    debug(this.statusCode + ' response should not use chunked encoding,' +
-          ' closing connection.');
-    this.chunkedEncoding = false;
-    this.shouldKeepAlive = false;
-  }
-
-  // keep-alive logic
-  if (this._removedConnection) {
-    this._last = true;
-    this.shouldKeepAlive = false;
-  } else if (!state.connection) {
-    const shouldSendKeepAlive = this.shouldKeepAlive &&
-        (state.contLen || this.useChunkedEncodingByDefault || this.agent);
-    if (shouldSendKeepAlive) {
-      header += 'Connection: keep-alive\r\n';
-    } else {
-      this._last = true;
-      header += 'Connection: close\r\n';
-    }
-  }
-
-  if (!state.contLen && !state.te) {
-    if (!this._hasBody) {
-      // Make sure we don't end the 0\r\n\r\n at the end of the message.
-      this.chunkedEncoding = false;
-    } else if (!this.useChunkedEncodingByDefault) {
-      this._last = true;
-    } else if (!state.trailer &&
-               !this._removedContLen &&
-               typeof this._contentLength === 'number') {
-      header += 'Content-Length: ' + this._contentLength + CRLF;
-    } else if (!this._removedTE) {
-      header += 'Transfer-Encoding: chunked\r\n';
-      this.chunkedEncoding = true;
-    } else {
-      // We should only be able to get here if both Content-Length and
-      // Transfer-Encoding are removed by the user.
-      // See: test/parallel/test-http-remove-header-stays-removed.js
-      debug('Both Content-Length and Transfer-Encoding are removed');
-    }
-  }
-
-  // Test non-chunked message does not have trailer header set,
-  // message will be terminated by the first empty line after the
-  // header fields, regardless of the header fields present in the
-  // message, and thus cannot contain a message body or 'trailers'.
-  if (this.chunkedEncoding !== true && state.trailer) {
-    throw new ERR_HTTP_TRAILER_INVALID();
-  }
+  ...
 
   this._header = header + CRLF;
-  this._headerSent = false;
+}
 
-  // Wait until the first body chunk, or close(), is sent to flush,
-  // UNLESS we're sending Expect: 100-continue.
-  if (state.expect) this._send('');
+function processHeader(self, state, key, value, validate) {
+  ...
+  storeHeader(self, state, key, value, validate);
+}
+
+function storeHeader(self, state, key, value, validate) {
+  ...
+  state.header += key + ': ' + value + CRLF;
+  matchHeader(self, state, key, value);
+}
+
+function matchHeader(self, state, field, value) {
+  if (field.length < 4 || field.length > 17)
+    return;
+  field = field.toLowerCase();
+  switch (field) {
+    case 'connection':
+      state.connection = true;
+      self._removedConnection = false;
+      if (RE_CONN_CLOSE.test(value))
+        self._last = true;
+      else
+        self.shouldKeepAlive = true;
+      break;
+    ...
+  }
 }
 ```
+
+从上面代码中看到这样的调用链路：
+_implicitHeader --> _storeHeader --> processHeader --> storeHeader --> matchHeader。
+
+* 首先调用processHeader，处理头部
+* 然后扶正this.shouldKeepAlive和头部。
+
 
 ![req.shouldKeepAlive](./img_hand/shouldKeepAlive.png)
 ![req.shouldKeepAliveMean](./img_hand/shouldKeepAliveMean.png)
