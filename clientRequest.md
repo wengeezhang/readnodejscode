@@ -365,7 +365,7 @@ Agent.prototype.addRequest = function addRequest(req, options, port, localAddres
     this.createSocket(req, options, handleSocketCreation(this, req, true));
   } else {
     debug('wait for socket');
-    // 4. 如果没有空闲的，且不能再创建，则先挤压起来
+    // 4. 如果没有空闲的，且不能再创建，则先积压起来
     // We are over limit so we'll add it to the queue.
     if (!this.requests[name]) {
       this.requests[name] = [];
@@ -377,7 +377,7 @@ Agent.prototype.addRequest = function addRequest(req, options, port, localAddres
 从上面代码可以看出，addRequest的作用为：
 * 如果有空闲的socket，则取出一个分配给req（setRequestSocket），去执行任务
 * 如果没有空闲的socket，并且可以创建（sockLen < this.maxSockets），则临时创建一个socket，分配给req，去执行任务
-* 如果没有空闲的socket，并且不可以创建，则把找个req挤压起来（this.requests[name].push(req)）;
+* 如果没有空闲的socket，并且不可以创建，则把找个req积压起来（this.requests[name].push(req)）;
 > 注：此处的name就是目标站点，比如”qq.com“。
 
 我们先看第一种情况，当有空闲的socket时，执行setRequestSocket。
@@ -928,170 +928,52 @@ agent是否同意，就是通过agent.keepAlive这个属性来设置的.
 
 由于场景复杂，nodejs处理socket的逻辑太过晦涩难懂，所以我们分情况来逐一分析，最终一探究竟。
 
-****1.客户端不同意，agent也不同意****
+先从统计视角，看下所有可能的情况：
+* 客户端不同意，agent不同意，服务器不同意
+* 客户端不同意，agent同意，服务器不同意
+* 客户端不同意，agent不同意，服务器同意（这种情况不存在）
+* 客户端不同意，agent同意，服务器同意（这种情况不存在）
+* 客户端同意，agent不同意，服务器不同意
+* 客户端同意，agent同意，服务器不同意
+* 客户端同意，agent不同意，服务器同意
+* 客户端同意，agent同意，服务器同意
+* 客户端未表示，agent不同意，服务器不同意
+* 客户端未表示，agent同意，服务器不同意
+* 客户端未表示，agent不同意，服务器同意（这种情况不存在）
+* 客户端未表示，agent同意，服务器同意
 
-决策点：connection:close，agent.keepAlive=false.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：false;
-发起请求时：false;
-收到返回时：false;
-最终设置为：false
-
-结果：
-socket被销毁
-
-****2.客户端不同意，agent同意****
-
-决策点：connection:close，agent.keepAlive=true.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：true;
-发起请求时：true;
-收到返回时：false;
-最终设置为：false
-
-结果：
-socket被销毁
-
-> 因为客户端不同意，所以服务端肯定会返回不同意。所以虽然一开始req.shouldKeepAlive为true，收到请求后，被扭转为了false。
-
-****3.客户端同意，agent不同意, 服务端不同意****
-
-决策点：connection:keep-alive，agent.keepAlive=false.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：false;
-发起请求时：true;
-收到返回时：false;
-最终设置为：false
-
-结果：
-socket被销毁
-
-****4.客户端同意，agent不同意, 服务端同意****
-
-决策点：connection:keep-alive，agent.keepAlive=false.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：false;
-发起请求时：true;
-收到返回时：true;
-最终设置为：true
-
-结果：
-如果有pending状态的请求，socket被复用；
-如果没有，socket被销毁。
+>【客户端不同意，agent不同意，服务器同意】和【客户端不同意，agent同意，服务器同意】这两种情况不存在。因为客户端表示不复用，意味着后续不会再发送请求，所以服务器保留就没有意义。因此服务器肯定会返回一个connection:close的头部。
+>
+>另外【客户端未明确表示，agent不同意，服务器同意】也不会存在。客户端虽然没有设置，但是检测到agent不同意，所以客户端会重设为不同意。这样就演变成【客户端不同意，agent不同意，服务器同意】。
 
 
-****5.客户端同意，agent同意，服务器不同意****
-
-决策点：connection:keep-alive，agent.keepAlive=true.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：true;
-发起请求时：true;
-收到返回时：false;
-最终设置为：false
-
-结果：
-socket被销毁
-
-****6.客户端同意，agent同意，服务器同意****
-
-决策点：connection:keep-alive，agent.keepAlive=true.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：true;
-发起请求时：true;
-收到返回时：true;
-最终设置为：true
-
-结果：
-socket被保留在agent中，供下次复用。
-
-****7.客户端未设置connection，agent不同意****
-
-决策点：agent.keepAlive=false.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：false;
-发起请求时：false;
-收到返回时：false;
-最终设置为：false
-
-结果：
-socket被销毁。
-
-> 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为false；同时根据这个信息，在msg._implicitHeader中设置为connection:close
-
-****8.客户端未设置connection，agent同意，服务器不同意****
-
-决策点：agent.keepAlive=true.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：true;
-发起请求时：true;
-收到返回时：false;
-最终设置为：false
-
-结果：
-socket被销毁。
-
-> 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为true；同时根据这个信息，在msg._implicitHeader中设置为connection:keep-alive.
-> 尽管如此，但是服务器不同意。所以收到的返回头connection:close，nodejs最终会把req.shouldKeepAlive设置为false
-
-****9.客户端未设置connection，agent同意，服务器同意****
-
-决策点：agent.keepAlive=true.
-
-决策信息req.shouldKeepAlive的值：
-初始化设置：true;
-发起请求时：true;
-收到返回时：true;
-最终设置为：true
-
-结果：
-socket被保留在agent中，供下次复用。
-
-> 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为true；同时根据这个信息，在msg._implicitHeader中设置为connection:keep-alive
-
-总结一下，只有4、6、9出现了socket复用，即满足以下三个条件：
-* 客户端和服务端同意，无论agent是否同意，都可能被复用
-  * agent同意，那么直接保留复用。
-  * agent不同意，如果有挤压的需求，那复用；如果没有挤压的需求，则销毁
-* agent和服务器同意，客户端没有设置connection:close时，就会被复用。
-
->引申一下就是:
->agent和服务器都是给client服务的。两个干活的都同意了，client只要没有明确表明要销毁，那就一律复用。
->虽然都是干活的，agent的地位最低。只要client和服务器协商同意复用，即使agent的不愿意复用，也不行：只要有挤压的请求，agent管辖的socket必须复用。
-
->我们来看下nodejs源码中，对于初始化req时，对于req.shouldKeepAlive的决策注释。希望这部分信息能够给读者提供一些帮助，一探其设计理念。
->If there is an agent we should default to Connection:keep-alive,
-    but only if the Agent will actually reuse the connection!
-    If it's not a keepAlive agent, and the maxSockets==Infinity, then
-    there's never a case where this socket will actually be reused
+去除不可能存在的情形，一共有9种。
 
 #####  3.源码解读
-我们从第2小节中列出的8类场景中，挑选第5个作为代表（客户端同意，agent同意，服务器同意），进行源码解读。
+从上面9种情形中，我们挑选一个有代表的【客户端同意，agent同意，服务器同意】，进行源码解读。
 
 首先设置样例：
 ```js
 // 样例代码
 const http = require('http');
+// 1.agent同意
 const newAgent = new http.Agent({keepAlive: true});
-const req = http.request('xx', {
+const req = http.request('someSvrApi', {
   agent: newAgent,
   headers: {
+    // 2.客户端同意
     "connection": "keep-alive"
   }
 }
 req.write('xxx');
 req.end();
+
+// 3. 假设someSvrApi所在的服务，同意复用
 ```
 
 样例代码中，创建req时，传入了一个keepAlive的newAgent，我们来看下这里的逻辑。
 
+****初始化时，shouldKeepAlive为true****
 ```js
 // 文件地址：/lib/_http_client.js
 if (this.agent) {
@@ -1110,23 +992,22 @@ if (this.agent) {
 ```
 
 可以看出，初始化的req（即this）的shouldKeepAlive被设置为了true。
+> 如果agent不同意，可以看到this.shouldKeepAlive 会被设置为 false;
 
-紧接着，样例代码调用了req.write('xx');
-req继承了outgoing，因此req.write就是OutgoingMessage.prototype.write。
+****发送请求时，shouldKeepAlive为true****
+紧接着，样例代码发送请求数据，调用了req.write('xxx');
+req继承了OutgoingMessage，因此req.write就是OutgoingMessage.prototype.write。
 我们看下这个逻辑。
 
 ```js
 // 文件地址：/lib/_http_outgoing.js
 OutgoingMessage.prototype.write = function write(chunk, encoding, callback) {
   const ret = write_(this, chunk, encoding, callback, false);
-  if (!ret)
-    this[kNeedDrain] = true;
-  return ret;
+  ...
 };
 
 function write_(msg, chunk, encoding, callback, fromEnd) {
   ...
-
   if (!msg._header) {
     msg._implicitHeader();
   }
@@ -1137,17 +1018,14 @@ function write_(msg, chunk, encoding, callback, fromEnd) {
 
 从上面代码看到，write调用了write_。
 
-write_代码里面判断是否有头部（!msg._header）。由于此时是第一次写，因此还没有msg._header，所以这里进行设置，即调用msg._implicitHeader。
+write_代码里面判断是否有头部（!msg._header）。由于此时是第一次写，因此还没有msg._header，所以这里调用msg._implicitHeader进行设置。
 
-> 注意：
-ClientRequest继承了OutgoingMessage。
+> 注意：ClientRequest继承了OutgoingMessage。
 
 ```js
 // 文件地址：/lib/_http_client.js
 ClientRequest.prototype._implicitHeader = function _implicitHeader() {
-  if (this._header) {
-    throw new ERR_HTTP_HEADERS_SENT('render');
-  }
+  ...
   this._storeHeader(this.method + ' ' + this.path + ' HTTP/1.1\r\n',
                     this[kOutHeaders]);
 };
@@ -1210,58 +1088,145 @@ function matchHeader(self, state, field, value) {
   }
 }
 ```
+> this[kOutHeaders]是在req初始化时创建的对象，表示发出请求的头部属性，比如{host: 'xxx'}
 
 从上面代码中看到这样的调用链路：
 _implicitHeader --> _storeHeader --> processHeader --> storeHeader --> matchHeader。
 
-* 首先调用processHeader，处理头部
-* 然后扶正this.shouldKeepAlive和头部。
+我们来看下：
+* _storeHeader的参数headers（即this[kOutHeaders]），表示请求的头部信息。
+  * 在当前样例中，它长这样：{"connection": "keep-alive","host": "xxx"}。
+  * 针对头部的每一个属性，调用processHeader进行处理
+* processHeader 调用storeHeader，再调用matchHeader。
+* 针对connection，matchHeader里面做以下处理：
+  * 设置state.connection = true;self._removedConnection = false;
+  * 由于我们的样例中connection的value是keep-alive，因此这里RE_CONN_CLOSE.test(value)为false，所以设置self.shouldKeepAlive = true;
 
+总结一下，经过_implicitHeader处理后，发生了以下变化：
+* req的shouldKeepAlive 被设置为了 true;
 
-![req.shouldKeepAlive](./img_hand/shouldKeepAlive.png)
-![req.shouldKeepAliveMean](./img_hand/shouldKeepAliveMean.png)
-req._removedConnection: 此字段表示发出去的header中是否去除了connection字段。
-removeHeader里，如果检测到connection去除，会将此字段设置为true
-matchHeader（即_storeHeader调用），如果检测到connection设置，会将此字段设置为false.
-
-后面_storeHeader会再次检测_removedConnection，如果为true，则标识即将发出去的头部没有connection头，则默认为后续不会有新的请求，对应的socket不会被复用。
-
-#### 2.5.1 通过agent创建的socket回收
-
-我们知道，nodejs是通过req.onSocket来分配socket的。其中有一段逻辑是这样的：
+****收到返回时，shouldKeepAlive为true****
+当收到服务端返回时，首先执行代码parserOnIncomingClient:
 
 ```js
-function tickOnSocket(req, socket) {
+// 文件位置：/lib/_http_client.js
+function parserOnIncomingClient(res, shouldKeepAlive) {
+  const socket = this.socket;
+  const req = socket._httpMessage;
   ...
-  // 注册事件
-  parser.onIncoming = parserOnIncomingClient;
-  socket.on('error', socketErrorListener);
-  socket.on('data', socketOnData);
-  socket.on('end', socketOnEnd);
-  socket.on('close', socketCloseListener);
-  socket.on('drain', ondrain);
+  if (req.shouldKeepAlive && !shouldKeepAlive && !req.upgradeOrConnect) {
+    // Server MUST respond with Connection:keep-alive for us to enable it.
+    // If we've been upgraded (via WebSockets) we also shouldn't try to
+    // keep the connection open.
+    req.shouldKeepAlive = false;
+  }
   ...
+  return 0;  // No special treatment.
+}
+```
+>parserOnIncomingClient(res, shouldKeepAlive)的第二个参数，是服务端返回的，表示是否保持链接的。
+在本样例中，由于服务端表示复用，因此这个参数的值是true。
+
+这段代码的逻辑核心在于，综合req.shouldKeepAlive && !shouldKeepAlive && !req.upgradeOrConnect三个属性，觉得是否重置req.shouldKeepAlive：
+在当前样例中，我们看下三个属性的值：
+* req.shouldKeepAlive：客户端请求req的自身属性--根据上文分析，这里是true
+* shouldKeepAlive：服务端返回的信息--此时为true
+* req.upgradeOrConnect: 此时为false。
+
+由此来看，最终if条件判断为false，因此req.shouldKeepAlive维持为true.
+
+> 这里我们可以看下，如果shouldKeepAlive为false（即服务端不同意），这里的if条件为true，会把req.shouldKeepAlive重置为false，即不复用。
+
+****最终shouldKeepAlive设置为true****
+经过以上分析，请求req.shouldKeepAlive为true。
+
+****结果****
+然后我们看请求结束时的处理：
+```js
+// 文件位置：/lib/_http_client.js
+function responseOnEnd() {
+  const req = this.req;
+  ...
+  req._ended = true; // 标示为结束
+  // 此时req.shouldKeepAlive为true，则不销毁，调用responseKeepAlive。
+  if (!req.shouldKeepAlive) {
+    const socket = req.socket;
+    if (socket.writable) {
+      debug('AGENT socket.destroySoon()');
+      if (typeof socket.destroySoon === 'function')
+        socket.destroySoon();
+      else
+        socket.end();
+    }
+    assert(!socket.writable);
+  } else if (req.finished && !this.aborted) {
+    responseKeepAlive(req);
+  }
 }
 ```
 
-当socket把请求处理完成后，最后发
+从上面代码中看到，req.shouldKeepAlive的值不同，会执行不同的收尾：
+* 为false: 进行销毁（即调用socket.destroySoon或者socket.end）
+* 为true: 维持复用（即调用responseKeepAlive）
 
+由于此时req.shouldKeepAlive=true，因此这里将调用responseKeepAlive(req)来维持socket复用。
+
+我们看下responseKeepAlive(req)是怎么维持socket的。
+
+```js
+// 文件位置：/lib/_http_client.js
+function responseKeepAlive(req) {
+  const socket = req.socket;
+  ...
+  defaultTriggerAsyncIdScope(asyncId, process.nextTick, emitFreeNT, req);
+  ...
+}
+
+function emitFreeNT(req) {
+  ...
+
+  if (req.socket) {
+    req.socket.emit('free');
+  }
+}
+```
+
+可以看到，这里调用了emitFreeNT，触发了一个free事件：req.socket.emit('free');
+
+通过分析发现，通过agent创建的socket，创建之初，有监听一个free：
+```js
+// 文件位置：/lib/_http_agent.js
+Agent.prototype.createSocket = function createSocket(req, options, cb) {
+  ...
+
+  const oncreate = once((err, s) => {
+    ...
+    installListeners(this, s, options);
+  });
+
+  const newSocket = this.createConnection(options, oncreate);
+  if (newSocket)
+    oncreate(null, newSocket);
+};
+
+function installListeners(agent, s, options) {
+  function onFree() {
+    debug('CLIENT socket onFree');
+    agent.emit('free', s, options);
+  }
+  s.on('free', onFree);
+}
+```
+
+从上面代码中看到，socket收到free事件时，调用了onFree，触发了一个agent的free事件。
+
+最后来看看agent的free事件：
 ```js
 // 文件地址：/lib/_http_agent.js
 this.on('free', (socket, options) => {
     const name = this.getName(options);
-    debug('agent.on(free)', name);
-
-    // TODO(ronag): socket.destroy(err) might have been called
-    // before coming here and have an 'error' scheduled. In the
-    // case of socket.destroy() below this 'error' has no handler
-    // and could cause unhandled exception.
-
-    if (!socket.writable) {
-      socket.destroy();
-      return;
-    }
-
+    ...
+    // 检测有没有积压的需求，如果有，则直接复用
     const requests = this.requests[name];
     if (requests && requests.length) {
       const req = requests.shift();
@@ -1272,14 +1237,15 @@ this.on('free', (socket, options) => {
       return;
     }
 
-    // If there are no pending requests, then put it in
-    // the freeSockets pool, but only if we're allowed to do so.
+    // 如果没有积压的需求，再看是否保留：此时req.shouldKeepAlive为true,this.keepAlive为true。
+    // 因此这里不会销毁
     const req = socket._httpMessage;
     if (!req || !req.shouldKeepAlive || !this.keepAlive) {
       socket.destroy();
       return;
     }
 
+    // 这里，把socket发到freeSockets中，以供后续使用。
     let freeSockets = this.freeSockets[name];
     const freeLen = freeSockets ? freeSockets.length : 0;
     let count = freeLen;
@@ -1304,7 +1270,158 @@ this.on('free', (socket, options) => {
   });
 ```
 
-#### 2.5.2 个性化socket回收
+****1.客户端不同意，agent也不同意，服务器不同意****
+
+决策点：connection:close，agent.keepAlive=false.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：false;
+发送请求时：false;
+收到返回时：false;
+最终设置为：false
+
+结果：
+socket被销毁
+
+****2.客户端不同意，agent同意，服务器不同意****
+
+决策点：connection:close，agent.keepAlive=true.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：true;
+发送请求时：true;
+收到返回时：false;
+最终设置为：false
+
+结果：
+socket被销毁
+
+> 服务端返回不同意。所以虽然一开始req.shouldKeepAlive为true，收到请求后，被扭转为了false。
+
+****3.客户端同意，agent不同意, 服务端不同意****
+
+决策点：connection:keep-alive，agent.keepAlive=false.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：false;
+发送请求时：true;
+收到返回时：false;
+最终设置为：false
+
+结果：
+socket被销毁
+
+****4.客户端同意，agent同意，服务器不同意****
+
+决策点：connection:keep-alive，agent.keepAlive=true.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：true;
+发送请求时：true;
+收到返回时：false;
+最终设置为：false
+
+结果：
+socket被销毁
+
+****5.客户端同意，agent不同意, 服务端同意****
+
+决策点：connection:keep-alive，agent.keepAlive=false.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：false;
+发送请求时：true;
+收到返回时：true;
+最终设置为：true
+
+结果：
+如果有pending状态的请求，socket被复用；
+如果没有，socket被销毁。
+
+****6.客户端同意，agent同意，服务器同意****
+
+决策点：connection:keep-alive，agent.keepAlive=true.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：true;
+发送请求时：true;
+收到返回时：true;
+最终设置为：true
+
+结果：
+socket被保留在agent中，供下次复用。
+
+****7.客户端未设置connection，agent不同意，服务不同意****
+
+决策点：agent.keepAlive=false.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：false;
+发送请求时：false;
+收到返回时：false;
+最终设置为：false
+
+结果：
+socket被销毁。
+
+> 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为false；同时根据这个信息，在msg._implicitHeader中设置为connection:close
+
+****8.客户端未设置connection，agent同意，服务器不同意****
+
+决策点：agent.keepAlive=true.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：true;
+发送请求时：true;
+收到返回时：false;
+最终设置为：false
+
+结果：
+socket被销毁。
+
+> 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为true；同时根据这个信息，在msg._implicitHeader中设置为connection:keep-alive.
+> 尽管如此，但是服务器不同意。所以收到的返回头connection:close，nodejs最终会把req.shouldKeepAlive设置为false
+
+****9.客户端未设置connection，agent同意，服务器同意****
+
+决策点：agent.keepAlive=true.
+
+决策信息req.shouldKeepAlive的值：
+初始化设置：true;
+发送请求时：true;
+收到返回时：true;
+最终设置为：true
+
+结果：
+socket被保留在agent中，供下次复用。
+
+> 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为true；同时根据这个信息，在msg._implicitHeader中设置为connection:keep-alive
+
+总结一下，只有5、6、9出现了socket复用，即满足以下三个条件：
+* 客户端和服务端同意，无论agent是否同意，都可能被复用
+  * agent同意，那么直接保留，供后续复用。
+  * agent不同意，如果有积压的需求，则直接复用；如果没有积压的需求，则销毁
+* agent和服务器同意，客户端没有明确要求时，会被复用。
+
+>引申一下就是:
+>agent和服务器都是给client服务的。如果两个干活的都同意了，client只要没有明确要求，那就一律复用。
+>虽然都是干活的，agent的地位最低。只要client和服务器协商同意复用，即使agent的不愿意也不行：只要有积压的请求，agent管辖的socket必须复用，不能休息（即回收销毁）。
+
+>我们来看下nodejs源码中，对于初始化req时，对于req.shouldKeepAlive的决策注释。希望这部分信息能够给读者提供一些帮助，一探其设计理念。
+>If there is an agent we should default to Connection:keep-alive,
+    but only if the Agent will actually reuse the connection!
+    If it's not a keepAlive agent, and the maxSockets==Infinity, then
+    there's never a case where this socket will actually be reused
+
+
+
+![req.shouldKeepAlive](./img_hand/shouldKeepAlive.png)
+![req.shouldKeepAliveMean](./img_hand/shouldKeepAliveMean.png)
+req._removedConnection: 此字段表示发出去的header中是否去除了connection字段。
+removeHeader里，如果检测到connection去除，会将此字段设置为true
+matchHeader（即_storeHeader调用），如果检测到connection设置，会将此字段设置为false.
+
+后面_storeHeader会再次检测_removedConnection，如果为true，则标识即将发出去的头部没有connection头，则默认为后续不会有新的请求，对应的socket不会被复用。
 
 
 
