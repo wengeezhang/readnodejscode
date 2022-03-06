@@ -1193,7 +1193,7 @@ function emitFreeNT(req) {
 
 可以看到，这里调用了emitFreeNT，触发了一个free事件：req.socket.emit('free');
 
-通过分析发现，通过agent创建的socket，创建之初，有监听一个free：
+通过分析发现，通过agent创建的socket，在创建之初，有监听一个free：
 ```js
 // 文件位置：/lib/_http_agent.js
 Agent.prototype.createSocket = function createSocket(req, options, cb) {
@@ -1269,6 +1269,23 @@ this.on('free', (socket, options) => {
     freeSockets.push(socket);
   });
 ```
+上面的代码逻辑很清晰明了，总结一下做了三个事情：
+* 首先检测有没有积压的请求，如果有，则直接用刚刚空闲的socket来发送请求；
+* 如果没有积压的请求(即当前无事可做)，那就判断是否销毁（通过agent.keepAlive来判断）
+  * 本质上是通过（!req || !req.shouldKeepAlive || !this.keepAlive）;
+  * 一般情况下，能到free回调的，基本req.shouldKeepAlive都是true。所以这里就退化为：只要agent.keepAlive为true，就不会被销毁
+* 如果没有被销毁，则放到freeSockets中，供下次请求时使用。
+
+
+> 从上面的分析看到，只有通过agent来处理的请求，才会管理req和socket，以达到复用的目的。
+> 如果是用户自己指定的socket发起请求，基本上就是发送完成就销毁了。
+
+以上就分析完了【客户端同意，agent同意，服务器同意】下socket是如何管理的。
+
+##### 4.汇总
+大家可以基于上面样例的分析，结合源码，自行分析下其他几种场景下socket的回收流程。
+
+下面我们简单汇总一下所有情形的socket回收流程：
 
 ****1.客户端不同意，agent也不同意，服务器不同意****
 
@@ -1397,16 +1414,31 @@ socket被保留在agent中，供下次复用。
 
 > 客户端没有设置connection头部，nodejs会检测agent的keepAlive属性，设置req.shouldKeepAlive为true；同时根据这个信息，在msg._implicitHeader中设置为connection:keep-alive
 
-总结一下，只有5、6、9出现了socket复用，即满足以下三个条件：
+总结一下，只有5、6、9出现了socket复用，即满足以下条件：
 * 客户端和服务端同意，无论agent是否同意，都可能被复用
   * agent同意，那么直接保留，供后续复用。
   * agent不同意，如果有积压的需求，则直接复用；如果没有积压的需求，则销毁
 * agent和服务器同意，客户端没有明确要求时，会被复用。
 
 >引申一下就是:
->agent和服务器都是给client服务的。如果两个干活的都同意了，client只要没有明确要求，那就一律复用。
->虽然都是干活的，agent的地位最低。只要client和服务器协商同意复用，即使agent的不愿意也不行：只要有积压的请求，agent管辖的socket必须复用，不能休息（即回收销毁）。
+>agent和服务器都是给client服务的。
+>即：client(主人) --> agent(服务员) --> service(服务员)
+>
+>如果两个干活的都同意了，client只要没有明确要求，那就一律复用。
+>
+>虽然都是干活的，agent的地位最低。只要client和服务器协商同意复用，即使agent的不愿意也不行：只要有积压的请求，agent管辖的socket必须复用，不能休息（即不能回收销毁）。
 
+
+# 四.总结
+
+* nodejs通过agent来对请求进行管理。
+* nodejs进程启动时，有一个默认agent来管理nodejs发起的请求。
+* socket是否复用，需要client、agent、service三方一起协商
+* 另外，nodejs保留了不使用agent来发起请求的方式（比如通过设定个性化的链接方式：options.createConnection）；这种情况下的socket用完即销毁
+
+
+# 附录
+****复用****
 >我们来看下nodejs源码中，对于初始化req时，对于req.shouldKeepAlive的决策注释。希望这部分信息能够给读者提供一些帮助，一探其设计理念。
 >If there is an agent we should default to Connection:keep-alive,
     but only if the Agent will actually reuse the connection!
@@ -1414,15 +1446,14 @@ socket被保留在agent中，供下次复用。
     there's never a case where this socket will actually be reused
 
 
-
+****shouldKeepAlive****
 ![req.shouldKeepAlive](./img_hand/shouldKeepAlive.png)
 ![req.shouldKeepAliveMean](./img_hand/shouldKeepAliveMean.png)
+
+****_removedConnection****
 req._removedConnection: 此字段表示发出去的header中是否去除了connection字段。
 removeHeader里，如果检测到connection去除，会将此字段设置为true
 matchHeader（即_storeHeader调用），如果检测到connection设置，会将此字段设置为false.
 
 后面_storeHeader会再次检测_removedConnection，如果为true，则标识即将发出去的头部没有connection头，则默认为后续不会有新的请求，对应的socket不会被复用。
 
-
-
-# 四.总结
