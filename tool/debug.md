@@ -174,3 +174,18 @@ launch.json有几类模式，我们先把官方文档的介绍贴出来：
 * Yeoman generator: Debug a yeoman generator. The snippet asks you to specify the name of the generator. Make sure that your project has 'yo' installed in its node_modules folder and that your generated project has been installed for debugging by running npm link in the project folder.
 * Gulp task: Debug a gulp task. Make sure that your project has 'gulp' installed in its node_modules folder.
 * Electron Main: Debug the main Node.js process of an Electron application. The snippet assumes that the Electron executable has been installed inside the node_modules/.bin directory of the workspace.
+
+# go debug
+go 的二进制指令程序运行后，可以通过 goland 的attach process 来进行调试，本质上使用的是 delve 启动一个服务，这个服务连接两个端：
+* 客户端
+  * 即 goland 编辑器，此时的编辑页面相当于一个浏览器页面，用来接受用户设置断点信息，发送给 delve;
+* 被调试程序端
+  * delve 写好终端向量后，此进程便可以查询并断点了。
+
+* 流程如下：
+  * 用户在 goland 编辑器中，在某个代码行最左侧点击设置断点后，便想 delve 进程发送数据，告诉它我想在这里断点。
+  * delve 进程收到信息后，向操作系统写入终端向量表。
+    * 因为delve 进程启动时候，已经指明了绑定的进程pid，因此它写入时会携带对于的进程信息。
+  * 进程运行指令时，实施查询中断向量表中，有没有关于自己的中断信息。如果有，则断住，同时把此时进程的栈上的信息发送给 delve
+  * delve 接收到中断环境信息后，发送给客户端 goland
+  * goland 以一定的形式展示给用户
